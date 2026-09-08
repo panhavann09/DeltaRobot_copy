@@ -4,30 +4,29 @@ dynamic_tracking_log.py — FK-based tracking-error logger, no camera/laser.
 
 Compares the commanded target against the robot's *actual* position, where
 "actual" comes from forward kinematics on live motor-encoder feedback
-(matlab_bridge_node.py's /delta/matlab/fk_result — published right after
+(pick_place_node.py's /delta/fk_result — published right after
 every settled move, see solve_fk_mm() over the CAN feedback thetas). Purely
 mechanical/encoder ground truth, independent of vision.
 
-Targets matlab_bridge_node.py specifically — that's the node both
-delta_main.launch.py and matlab_bridge.launch.py actually start (executable
-"matlab_bridge"; main_app.py has a console-script entry but is NOT wired
-into any launch file, so it isn't the live pick-place brain). Both target
-and FK-actual are read in the same platform-frame mm the bridge already
-uses, so no unit conversion is needed here.
+Targets pick_place_node.py specifically — that's the node both
+delta_main.launch.py and pick_place.launch.py actually start (executable
+"pick_place"). Both target and FK-actual are read in the same
+platform-frame mm the bridge already uses, so no unit conversion is needed
+here.
 
 Meant to compare the 2x2 matrix of conditions:
     belt stationary / belt moving   ×   ADRC_BIAS_ENABLE False / True
 config.ADRC_BIAS_ENABLE is read at startup and stamped into the filename/
 summary automatically, so a run is self-documenting either way. --run-label
 just tags belt state for the filename (e.g. "static" / "moving") — set
-config.ADRC_BIAS_ENABLE and restart matlab_bridge_node + this node between
+config.ADRC_BIAS_ENABLE and restart pick_place_node + this node between
 runs to cover all four combinations (bias_observer's d_hat is in-memory and
 resets on restart; it lives inside DeltaMotorController, shared by every
 frontend node, so it doesn't matter which frontend calls it).
 
 Per-pick accuracy/repeatability: this node also listens to
-/delta/matlab/bridge_state and, on each transition into LIFT (the bridge FSM
-state right after PneumaticGripper.grip() fires — see matlab_bridge_node.py
+/delta/bridge_state and, on each transition into LIFT (the bridge FSM
+state right after PneumaticGripper.grip() fires — see pick_place_node.py
 _run_move()), snapshots the current tracking error as that pick's "accuracy"
 sample — the moment the gripper actually closes, not the noisier in-flight
 approach samples. After N_PICKS such events (default 10, override with
@@ -35,7 +34,7 @@ approach samples. After N_PICKS such events (default 10, override with
 repeatability (std) across the picks, alongside the existing raw
 per-sample CSV/summary.
 
-Requires matlab_bridge_node.py already running the normal pick cycle (e.g.
+Requires pick_place_node.py already running the normal pick cycle (e.g.
 via delta_main.launch.py) — this node only listens, it does not move the
 robot.
 
@@ -86,16 +85,16 @@ class DynamicTrackingLog(Node):
         self.request_stop = False
 
         self.create_subscription(
-            DeltaTarget, "/delta/matlab/target_xyz", self._on_target, 10
+            DeltaTarget, "/delta/target_committed", self._on_target, 10
         )
         self.create_subscription(
             PointStamped, "/delta/object_velocity_mm_s", self._on_velocity, 10
         )
         self.create_subscription(
-            PointStamped, "/delta/matlab/fk_result", self._on_ee, 10
+            PointStamped, "/delta/fk_result", self._on_ee, 10
         )
         self.create_subscription(
-            String, "/delta/matlab/bridge_state", self._on_state, 10
+            String, "/delta/bridge_state", self._on_state, 10
         )
 
         self.get_logger().info(

@@ -7,7 +7,7 @@ cv2.VideoCapture instead of subscribing to a camera-driver ROS node's topics.
 This removes the camera-driver -> DDS serialization -> subscriber hop
 entirely. The camera has no depth stream, so depth_img is always None here —
 downstream code already falls back to an invalid DepthEstimate in that case,
-and matlab_bridge_node uses config.FAKE_DEPTH_M for Z.
+and pick_place_node uses config.FAKE_DEPTH_M for Z.
 
 Do not run this alongside plant_perception_node.py — only one process can
 hold the camera device open at a time.

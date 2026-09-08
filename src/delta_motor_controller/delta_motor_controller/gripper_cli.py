@@ -8,7 +8,7 @@ Usage:
     python3 gripper_cli.py open   [can_channel]
     python3 gripper_cli.py close  [can_channel]
 
-can_channel defaults to 'can1' (matches matlab_bridge_node.py / main_app.py).
+can_channel defaults to 'can1' (matches pick_place_node.py).
 Use 'can0' if you're testing against the blind_pick_place / can_driver_node setup.
 """
 

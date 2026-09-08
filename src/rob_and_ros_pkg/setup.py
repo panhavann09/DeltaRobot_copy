@@ -24,7 +24,6 @@ setup(
     },
     entry_points={
         'console_scripts': ['rob_n_ros_node = rob_and_ros_pkg.rob_n_ros:main',
-                            'motor_sub_node = rob_and_ros_pkg.motor_sub_node:main',
                             'motor_pub_node = rob_and_ros_pkg.motor_pub_node:main',
                             'simple_pub_node = rob_and_ros_pkg.simple_pub_node:main',
                             'simple_sub_node = rob_and_ros_pkg.simple_sub_node:main',

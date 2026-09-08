@@ -29,9 +29,9 @@ def generate_launch_description():
         output="screen",
     )
 
-    matlab_bridge = Node(
+    pick_place = Node(
         package="delta_main_app",
-        executable="matlab_bridge",
+        executable="pick_place",
         output="screen",
     )
 
@@ -48,6 +48,6 @@ def generate_launch_description():
         DeclareLaunchArgument("camera_fps",    default_value="30"),
         uvc_camera,
         camera_node,
-        matlab_bridge,
+        pick_place,
         test1,
     ])

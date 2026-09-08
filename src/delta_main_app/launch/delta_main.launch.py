@@ -59,9 +59,9 @@ def generate_launch_description():
         output="screen",
     )
 
-    main_app = Node(
+    pick_place = Node(
         package="delta_main_app",
-        executable="matlab_bridge",
+        executable="pick_place",
         output="screen",
     )
 
@@ -81,6 +81,6 @@ def generate_launch_description():
         rviz,
         uvc_camera,
         camera_node,
-        main_app,
+        pick_place,
         test1,
     ])

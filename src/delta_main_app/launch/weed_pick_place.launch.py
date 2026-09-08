@@ -1,9 +1,9 @@
 """One-shot launch for weed picking: plant_perception's direct-camera
 pipeline (merge_code_test.py — opens the UVC global-shutter camera device
 itself, no separate camera-driver node) + weed_bridge_node (/delta/target_xyz
-etc.) + matlab_bridge (the actual pick/place FSM driving the motors).
+etc.) + pick_place (the actual pick/place FSM driving the motors).
 
-ENABLE_MOTORS is True in delta_common/config.py by default — matlab_bridge
+ENABLE_MOTORS is True in delta_common/config.py by default — pick_place
 will command the real motors/gripper the moment a valid weed target arrives.
 Make sure the workspace is clear and you're watching the arm before running
 this.
@@ -42,9 +42,9 @@ def generate_launch_description():
         output="screen",
     )
 
-    matlab_bridge = Node(
+    pick_place = Node(
         package="delta_main_app",
-        executable="matlab_bridge",
+        executable="pick_place",
         output="screen",
     )
 
@@ -65,6 +65,6 @@ def generate_launch_description():
         ),
         plant_perception_node,
         weed_bridge_node,
-        matlab_bridge,
+        pick_place,
         viewer,
     ])

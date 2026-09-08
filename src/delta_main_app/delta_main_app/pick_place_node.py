@@ -1,52 +1,30 @@
 #!/usr/bin/env python3
 """
-matlab_bridge_node.py — Delta robot MATLAB IK bridge with built-in FSM.
+pick_place_node.py — Delta robot vision-guided pick-and-place with local IK.
 
-Receives a confirmed target XYZ from the camera pipeline, packages it into
-a DeltaTarget custom message, and sends it to MATLAB for IK solving.
-MATLAB publishes the joint angles back as DeltaJointAngles.  The node
-executes the move, grips, then drives straight home (no lift, no place
-stop) and releases there — either chaining straight into the next queued
-pick or landing in IDLE.
+Receives a confirmed target XYZ from the camera pipeline and solves inverse
+kinematics locally (delta_common.fk_ik.solve_ik_mm) — no external solver
+round-trip. The node executes the move, grips, then drives straight home (no
+lift, no place stop) and releases there — either chaining straight into the
+next queued pick or landing in IDLE.
 
-━━━━ ROS2 ↔ MATLAB topic map ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  Camera → Bridge  (subscribe):
+━━━━ Topic map ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Camera → Node    (subscribe):
       /delta/target_xyz            geometry_msgs/PointStamped
           x/y/z in mm, robot base frame, EE-tip Z
 
-  Bridge → MATLAB  (publish):
-      /delta/matlab/target_xyz     custom_messages/DeltaTarget
-          x_mm, y_mm, z_mm, confidence, track_id, detection_mode
-
-  MATLAB → Bridge  (subscribe):
-      /delta/matlab/joint_thetas   custom_messages/DeltaJointAngles
-          theta1_deg, theta2_deg, theta3_deg, ik_valid
-
-  Bridge → All     (publish):
-      /delta/matlab/bridge_state   std_msgs/String   — current FSM state
-      /delta/matlab/fk_result      geometry_msgs/PointStamped — FK after move
-
-━━━━ MATLAB code (Robotics System Toolbox ≥ R2022b) ━━━━━━━━━━━━━━━━━━━
-  node = ros2node("/matlab_ik");
-  sub  = ros2subscriber(node, "/delta/matlab/target_xyz",
-                        "custom_messages/DeltaTarget");
-  pub  = ros2publisher(node, "/delta/matlab/joint_thetas",
-                       "custom_messages/DeltaJointAngles");
-  while true
-      tgt = receive(sub, 10);              % 10 s timeout
-      x = tgt.x_mm;  y = tgt.y_mm;  z = tgt.z_mm;
-      [t1, t2, t3, valid] = my_delta_ik(x, y, z);
-      reply = ros2message("custom_messages/DeltaJointAngles");
-      reply.theta1_deg = t1;
-      reply.theta2_deg = t2;
-      reply.theta3_deg = t3;
-      reply.ik_valid   = valid;
-      send(pub, reply);
-  end
+  Node → All       (publish):
+      /delta/target_committed      custom_messages/DeltaTarget
+          x_mm, y_mm, z_mm, confidence, track_id, detection_mode — telemetry
+          for the target this node has committed to and is solving/executing
+      /delta/bridge_state          std_msgs/String   — current FSM state
+      /delta/fk_result             geometry_msgs/PointStamped — FK after move
+      /delta/motor_thetas          custom_messages/DeltaJointAngles — live
+          motor-encoder feedback, published as telemetry after every move
 
 ━━━━ State machine ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  IDLE → WAITING_MATLAB → MOVING(+grip) → HOMING(+release) ─┬─→ WAITING_MATLAB (next pick, chained)
-                        ↘ ERROR ────────────────────────────┴─→ IDLE (no next pick queued)
+  IDLE → MOVING(+grip) → HOMING(+release) ─┬─→ MOVING (next pick, chained)
+       ↘ ERROR ───────────────────────────┴─→ IDLE (no next pick queued)
 """
 
 import collections
@@ -69,28 +47,20 @@ from delta_main_app.belt_predictor import BeltPredictor
 from delta_motor_controller.motor_controller import DeltaMotorController
 from delta_motor_controller.pneumatic_gripper import PneumaticGripper
 
-MATLAB_TIMEOUT_S     = 3.0    # seconds to wait for MATLAB joint-angle reply
-# False: skip the MATLAB round-trip entirely — compute joint angles locally via
-# delta_common.fk_ik.solve_ik_mm right after committing the target, instead of
-# publishing to /delta/matlab/target_xyz and waiting on /delta/matlab/joint_thetas.
-# For testing when MATLAB/sim4_ROS2_delta isn't available. The DeltaTarget is
-# still published either way (for visibility); this only decides where the
-# joint angles that actually drive the motors come from.
-USE_MATLAB = True
 # Was -15.0 (forced extra descent below detected surface). Removed 2026-07-09 —
 # with the Z-guard/floor check gone, that overrun went uncaught and picks were
 # landing too deep. Target Z now matches the detected surface exactly.
-Z_DROP_EXTRA_MM      = -25.0    # extra descent commanded to MATLAB on pick (deeper = more negative)
+Z_DROP_EXTRA_MM      = -25.0    # extra descent commanded on pick (deeper = more negative)
 
-# Safety: maximum depth MATLAB's IK result may command beyond the detected target Z.
-# If the FK of MATLAB's thetas puts the EE-tip more than this below the detected
-# surface, the move is rejected before any motors move.
-# Includes headroom for the intentional Z_DROP_EXTRA_MM offset above, plus the
-# original 20mm anomaly margin for MATLAB's own correction.
-MATLAB_Z_GUARD_MM    = 20.0 + abs(Z_DROP_EXTRA_MM)
+# Safety: maximum depth the local IK solver's result may command beyond the
+# detected target Z. If the FK of the solved thetas puts the EE-tip more than
+# this below the detected surface, the move is rejected before any motors move.
+# Includes headroom for the intentional Z_DROP_EXTRA_MM offset above, plus a
+# 20mm anomaly margin for the solver's own correction.
+IK_Z_GUARD_MM        = 20.0 + abs(Z_DROP_EXTRA_MM)
 # Hard absolute floor for EE-tip Z (mm, robot base frame, negative = below base).
 # Crash confirmed at EE-tip < -640 mm.  Set 5 mm above that as the kill limit.
-# Checked on BOTH the incoming detected target AND the MATLAB-commanded position.
+# Checked on BOTH the incoming detected target AND the IK-commanded position.
 EETIP_Z_FLOOR_MM     = -638.0
 
 # ── Rigid-object Z estimation ─────────────────────────────────────────────────
@@ -114,24 +84,23 @@ Z_HISTORY_RESET_MM    = 50.0  # XY distance that triggers a buffer reset (mm)
 
 # ── State machine ──────────────────────────────────────────────────────────────
 
-class MatlabBridgeFSM:
+class PickPlaceFSM:
     """
     Pure FSM — no ROS dependency; driven by the ROS node via public methods.
 
     States
     ------
     IDLE            : home pose (theta=0,0,0), gripper open, waiting for a target
-    WAITING_MATLAB  : DeltaTarget published; waiting for DeltaJointAngles back
-    MOVING          : executing the MATLAB theta solution on the motors; grips
+    MOVING          : executing the locally-solved IK thetas on the motors; grips
                       once settled (bg thread)
     HOMING          : no lift, no place stop — drives straight to theta=0,0,0
                       with the object gripped, releases once settled, then
                       either chains straight into the next queued target
-                      (WAITING_MATLAB, no trip through IDLE) or lands IDLE
+                      (MOVING, no trip through IDLE) or lands IDLE
                       (bg thread)
-    ERROR           : any failure (MATLAB timeout/ik_valid=False, unreachable
-                      thetas, or a move that never settled) — forces the
-                      gripper open, returns home, recovers to IDLE
+    ERROR           : any failure (invalid IK solution, unreachable thetas, or
+                      a move that never settled) — forces the gripper open,
+                      returns home, recovers to IDLE
     """
 
     def __init__(self, controller: DeltaMotorController, publish_state_fn, publish_fk_fn,
@@ -141,7 +110,7 @@ class MatlabBridgeFSM:
         self._pub_state         = publish_state_fn         # fn(state: str)
         self._pub_fk             = publish_fk_fn             # fn(x, y, z)
         self._pub_motor_thetas   = publish_motor_thetas_fn   # fn(fb_deg, ok)
-        self._pub_target         = publish_target_fn         # fn(x_m, y_m, z_m) -> None, sends DeltaTarget to MATLAB
+        self._pub_target         = publish_target_fn         # fn(x_m, y_m, z_m) -> None, publishes committed-target telemetry
         self._gripper            = gripper                   # PneumaticGripper | None
         self._pub_gripper        = publish_gripper_fn        # fn(pos: float) -> None, pos: 1.0=grip 0.0=release
         self._log                = logger
@@ -152,8 +121,7 @@ class MatlabBridgeFSM:
 
         self._target_xyz      = None   # (x, y, z) metres — target currently being worked
         self._target_detect_t = None   # time.time() when this target was received
-        self._matlab_thetas   = None   # (t1, t2, t3) deg
-        self._wait_start      = 0.0
+        self._ik_thetas       = None   # (t1, t2, t3) deg
         self._pending_target  = None   # (x, y, z, detect_time) received while busy — PLACING
                                         # picks this up so the next pick chains immediately,
                                         # with no return-home in between.
@@ -183,90 +151,48 @@ class MatlabBridgeFSM:
                 return False
             self._commit_target(x, y, z, detect_time)
         self._pub_target(x, y, z)
-        if not USE_MATLAB:
-            self._solve_locally_and_proceed(x, y, z)
+        self._solve_ik_and_proceed(x, y, z)
         return True
 
-    def _solve_locally_and_proceed(self, x: float, y: float, z: float) -> None:
-        """USE_MATLAB=False path: compute joint angles via delta_common's own
-        solve_ik_mm instead of waiting on MATLAB, then feed them through the
-        exact same on_matlab_reply() logic MATLAB's real reply would use."""
+    def _solve_ik_and_proceed(self, x: float, y: float, z: float) -> None:
+        """Compute joint angles locally via delta_common's solve_ik_mm and
+        start the move — no external solver round-trip."""
         x_mm = x * 1000.0
         y_mm = y * 1000.0
         z_platform_mm = z * 1000.0 + config.EE_OFFSET_Z_MM + Z_DROP_EXTRA_MM
         ok_ik, t1, t2, t3 = solve_ik_mm(x_mm, y_mm, z_platform_mm)
-        self.on_matlab_reply(t1, t2, t3, ok_ik)
+        self._begin_move(t1, t2, t3, ok_ik)
 
     def _commit_target(self, x: float, y: float, z: float, detect_time=None) -> None:
         """Must be called with self._lock held. Commits (x,y,z) as the active
-        target and starts a fresh WAITING_MATLAB cycle for it. Caller is
-        responsible for publishing it to MATLAB (outside the lock)."""
+        target. Caller is responsible for publishing telemetry and solving IK
+        (outside the lock)."""
         self._target_xyz      = (x, y, z)
         self._target_detect_t = detect_time if detect_time is not None else time.time()
-        self._matlab_thetas   = None
+        self._ik_thetas       = None
         self._busy            = True
-        self._wait_start      = time.time()
-        self._set_state("WAITING_MATLAB")
 
-    def update_target(self, x: float, y: float, z: float, detect_time=None) -> bool:
-        """Refresh the pending target with a fresher detection while still
-        WAITING_MATLAB for it, so error/timeout logging reflects the latest
-        reading. Returns True if the target was refreshed."""
-        with self._lock:
-            if self._state == "WAITING_MATLAB":
-                self._target_xyz = (x, y, z)
-                self._target_detect_t = detect_time if detect_time is not None else time.time()
-                return True
-            return False
-
-    def on_matlab_reply(self, t1: float, t2: float, t3: float, ik_valid: bool) -> None:
-        """Handle DeltaJointAngles from MATLAB."""
-        invalid = False
-        with self._lock:
-            if self._state != "WAITING_MATLAB":
-                return
-            if not ik_valid:
-                self._log.error(
-                    f"MATLAB reported ik_valid=False for target "
-                    f"({self._target_xyz[0]:.1f},{self._target_xyz[1]:.1f},"
-                    f"{self._target_xyz[2]:.1f}) — aborting"
-                )
-                invalid = True
-            else:
-                self._matlab_thetas = (t1, t2, t3)
-                self._set_state("MOVING")
-        # _go_error() acquires self._lock itself, so it must run after the
-        # lock above is released (threading.Lock is not reentrant).
-        if invalid:
+    def _begin_move(self, t1: float, t2: float, t3: float, ik_valid: bool) -> None:
+        """Start MOVING with the solved joint angles, or abort to ERROR if the
+        IK solver found no valid solution."""
+        if not ik_valid:
+            self._log.error(
+                f"IK solver reported no valid solution for target "
+                f"({self._target_xyz[0]:.1f},{self._target_xyz[1]:.1f},"
+                f"{self._target_xyz[2]:.1f}) — aborting"
+            )
             self._go_error()
             return
-        threading.Thread(target=self._run_move, daemon=True).start()
-
-    def tick(self) -> None:
-        """Call at ~10 Hz to enforce the MATLAB response timeout."""
-        timed_out = False
         with self._lock:
-            if self._state != "WAITING_MATLAB":
-                return
-            elapsed = time.time() - self._wait_start
-            if elapsed > MATLAB_TIMEOUT_S:
-                self._log.error(
-                    f"MATLAB timeout ({elapsed:.1f} s > {MATLAB_TIMEOUT_S} s) — "
-                    f"no reply for target "
-                    f"({self._target_xyz[0]:.1f},{self._target_xyz[1]:.1f},"
-                    f"{self._target_xyz[2]:.1f})"
-                )
-                timed_out = True
-        # _go_error() acquires self._lock itself, so it must run after the
-        # lock above is released (threading.Lock is not reentrant).
-        if timed_out:
-            self._go_error()
+            self._ik_thetas = (t1, t2, t3)
+            self._set_state("MOVING")
+        threading.Thread(target=self._run_move, daemon=True).start()
 
     # ── background threads ─────────────────────────────────────────────────────
 
     def _run_move(self) -> None:
-        """State MOVING: drive to MATLAB's thetas, verify settle, then grip."""
-        t1, t2, t3 = self._matlab_thetas
+        """State MOVING: drive to the IK-solved thetas, verify settle, then grip."""
+        t1, t2, t3 = self._ik_thetas
 
         # Hard clamp: reject before any physical move if the detected target
         # itself is already beyond the crash floor.
@@ -280,12 +206,12 @@ class MatlabBridgeFSM:
             return
 
         self._log.info(
-            f"Executing MATLAB thetas: θ1={t1:.2f}° θ2={t2:.2f}° θ3={t3:.2f}°"
+            f"Executing IK thetas: θ1={t1:.2f}° θ2={t2:.2f}° θ3={t3:.2f}°"
         )
 
         if not self._ctrl.within_joint_limits(t1, t2, t3):
             self._log.error(
-                f"MATLAB thetas outside joint limits "
+                f"IK thetas outside joint limits "
                 f"(limits θ_max={config.THETA1_MAX}°): "
                 f"({t1:.1f},{t2:.1f},{t3:.1f}) — aborting"
             )
@@ -293,15 +219,15 @@ class MatlabBridgeFSM:
             return
 
         # ── Z guard ───────────────────────────────────────────────────────────
-        # Compute FK of MATLAB's thetas BEFORE sending to motors. If the
+        # Compute FK of the solved thetas BEFORE sending to motors. If the
         # resulting EE-tip Z is below the absolute floor, or more than
-        # MATLAB_Z_GUARD_MM below the detected target surface, reject the
-        # move — MATLAB's correction must not drive the gripper through the
+        # IK_Z_GUARD_MM below the detected target surface, reject the move —
+        # the solver's own correction must not drive the gripper through the
         # belt/terrain.
         ok_fk, _, _, z_platform_commanded = solve_fk_mm(t1, t2, t3)
         if not ok_fk:
             self._log.error(
-                f"Z guard: FK of MATLAB thetas ({t1:.1f},{t2:.1f},{t3:.1f})° "
+                f"Z guard: FK of IK thetas ({t1:.1f},{t2:.1f},{t3:.1f})° "
                 "returned no solution — aborting"
             )
             self._go_error()
@@ -315,15 +241,15 @@ class MatlabBridgeFSM:
         )
         if z_eetip_commanded < EETIP_Z_FLOOR_MM:
             self._log.error(
-                f"Z floor TRIP: MATLAB commands EE-tip={z_eetip_commanded:.1f}mm "
+                f"Z floor TRIP: IK commands EE-tip={z_eetip_commanded:.1f}mm "
                 f"< floor={EETIP_Z_FLOOR_MM}mm — aborting"
             )
             self._go_error()
             return
-        if overrun > MATLAB_Z_GUARD_MM:
+        if overrun > IK_Z_GUARD_MM:
             self._log.error(
-                f"Z guard TRIP: MATLAB commands EE-tip {overrun:.1f}mm below "
-                f"detected surface (guard={MATLAB_Z_GUARD_MM}mm) — aborting"
+                f"Z guard TRIP: IK commands EE-tip {overrun:.1f}mm below "
+                f"detected surface (guard={IK_Z_GUARD_MM}mm) — aborting"
             )
             self._go_error()
             return
@@ -398,16 +324,15 @@ class MatlabBridgeFSM:
         if pending is not None:
             x, y, z, _ = pending
             self._pub_target(x, y, z)
-            if not USE_MATLAB:
-                self._solve_locally_and_proceed(x, y, z)
-            return   # already back in WAITING_MATLAB for the next target
+            self._solve_ik_and_proceed(x, y, z)
+            return   # already moving on the next target
 
         # Already homed above — just land the state, no second home move.
         with self._lock:
             self._state          = "IDLE"
             self._busy            = False
             self._target_xyz      = None
-            self._matlab_thetas   = None
+            self._ik_thetas        = None
         self._pub_state("IDLE")
         self._log.info("[FSM] → IDLE")
 
@@ -418,8 +343,8 @@ class MatlabBridgeFSM:
 
     def _recover(self) -> None:
         """Force the gripper open, return home, and land in IDLE — the single
-        shared recovery path for every failure mode (MATLAB timeout/invalid,
-        unreachable thetas, or a move that never settled)."""
+        shared recovery path for every failure mode (invalid/unreachable IK
+        solution, or a move that never settled)."""
         if self._gripper is not None:
             self._log.info("ERROR recovery — forcing gripper open")
             try:
@@ -436,7 +361,7 @@ class MatlabBridgeFSM:
             self._state           = "IDLE"
             self._busy             = False
             self._target_xyz       = None
-            self._matlab_thetas    = None
+            self._ik_thetas         = None
             self._pending_target   = None
         self._pub_state("IDLE")
         self._log.info("[FSM] → IDLE (recovered from ERROR)")
@@ -449,16 +374,17 @@ class MatlabBridgeFSM:
 
 # ── ROS2 node ──────────────────────────────────────────────────────────────────
 
-class MatlabBridgeNode(Node):
+class PickPlaceNode(Node):
     """
-    Bridges the delta robot camera pipeline with a MATLAB IK solver.
+    Vision-guided pick-and-place FSM for the delta robot — commands the
+    physical motors/gripper directly from locally-solved IK.
 
-    Run alongside the camera node (NOT alongside delta_main_app — they both
-    consume /delta/target_xyz and command the same motors).
+    Run alongside the camera node. Should be the only node commanding the
+    motors at a time (they share can1).
     """
 
     def __init__(self):
-        super().__init__("matlab_bridge_node")
+        super().__init__("pick_place_node")
 
         # ── motor controller ──────────────────────────────────────────────────
         self._ctrl = DeltaMotorController(
@@ -480,11 +406,11 @@ class MatlabBridgeNode(Node):
             self.get_logger().info("Gripper connected (direct CAN).")
 
         # ── publishers ────────────────────────────────────────────────────────
-        self._pub_to_matlab = self.create_publisher(
-            DeltaTarget, "/delta/matlab/target_xyz", 100
+        self._pub_target_committed = self.create_publisher(
+            DeltaTarget, "/delta/target_committed", 100
         )
         self._pub_state = self.create_publisher(
-            String, "/delta/matlab/bridge_state", 10
+            String, "/delta/bridge_state", 10
         )
         # Gripper state — [0=open, 1=closed], mirrors main_app.py's topic so
         # `ros2 topic echo /delta/gripper_cmd` works regardless of which node
@@ -498,22 +424,18 @@ class MatlabBridgeNode(Node):
         )
         self._send_gripper(0.0)   # connect() above already released — reflect it immediately
         self._pub_fk = self.create_publisher(
-            PointStamped, "/delta/matlab/fk_result", 10
+            PointStamped, "/delta/fk_result", 10
         )
         # Actual motor-encoder thetas (CAN feedback), read back after every
-        # move and republished to MATLAB — separate from the commanded
-        # /delta/matlab/joint_thetas MATLAB sends us.
+        # move and published as telemetry.
         self._pub_motor_thetas = self.create_publisher(
-            DeltaJointAngles, "/delta/matlab/motor_thetas", 10
+            DeltaJointAngles, "/delta/motor_thetas", 10
         )
         # Shared EE-tip FK — read by camera_system
         self._pub_ee_fk = self.create_publisher(
             PointStamped, "/delta/ee_fk_xyz", 10
         )
-        # EE position for MATLAB's predict_target block — must be published
-        # so /delta/ee_position_mm has a real source when running this bridge
-        # (main_app publishes the same data via /delta/matlab/ee_position_mm,
-        # but MATLAB's model subscribes to /delta/ee_position_mm).
+        # EE position telemetry — belt-prediction/logging consumers subscribe here.
         self._pub_ee_pos_mm = self.create_publisher(
             PointStamped, "/delta/ee_position_mm", 10
         )
@@ -523,12 +445,12 @@ class MatlabBridgeNode(Node):
         self._pub_joint_states = self.create_publisher(JointState, "joint_states", 10)
 
         # ── FSM ───────────────────────────────────────────────────────────────
-        self._fsm = MatlabBridgeFSM(
+        self._fsm = PickPlaceFSM(
             controller=self._ctrl,
             publish_state_fn=self._send_state,
             publish_fk_fn=self._send_fk,
             publish_motor_thetas_fn=self._send_motor_thetas,
-            publish_target_fn=self._send_target_to_matlab,
+            publish_target_fn=self._publish_target_committed,
             logger=self.get_logger(),
             gripper=self._gripper,
             publish_gripper_fn=self._send_gripper,
@@ -570,9 +492,6 @@ class MatlabBridgeNode(Node):
         self._z_history_xy: tuple | None = None   # (x_m, y_m) of buffered readings
 
         # ── belt velocity / pick-point prediction ───────────────────────────────
-        # USE_MATLAB=False bypasses MATLAB's Simulink predict_target block, which
-        # otherwise would have compensated for belt motion during travel time.
-        # BeltPredictor (same logic main_app.py uses) replaces it here.
         self._predictor = BeltPredictor()
         self._last_robot_x_mm = config.HOME_X   # updated on every FK publish
 
@@ -581,12 +500,6 @@ class MatlabBridgeNode(Node):
             PointStamped,
             "/delta/target_xyz",
             self._on_target_xyz,
-            10,
-        )
-        self._sub_matlab = self.create_subscription(
-            DeltaJointAngles,
-            "/delta/matlab/joint_thetas",
-            self._on_joint_angles,
             10,
         )
         self._sub_depth = self.create_subscription(
@@ -602,18 +515,14 @@ class MatlabBridgeNode(Node):
             1,
         )
 
-        # ── 10 Hz tick for MATLAB timeout ─────────────────────────────────────
-        self.create_timer(0.1, self._fsm.tick)
         # ── 5 Hz FK heartbeat — keeps camera_system's ee_fk_xyz fresh ─────────
         self.create_timer(0.2, self._publish_fk_heartbeat)
 
         self.get_logger().info(
-            "MatlabBridgeNode ready\n"
+            "PickPlaceNode ready\n"
             "  Listening : /delta/target_xyz\n"
-            "  → MATLAB  : /delta/matlab/target_xyz   (DeltaTarget)\n"
-            "  ← MATLAB  : /delta/matlab/joint_thetas (DeltaJointAngles)\n"
-            "  State     : /delta/matlab/bridge_state\n"
-            f"  MATLAB timeout: {MATLAB_TIMEOUT_S} s"
+            "  State     : /delta/bridge_state\n"
+            "  IK solved locally — no external solver round-trip"
         )
 
     # ── callbacks ─────────────────────────────────────────────────────────────
@@ -683,15 +592,15 @@ class MatlabBridgeNode(Node):
                 )
 
         if not self._fsm.on_target(x, y, z, detect_time=detect_time):
-            if not self._fsm.update_target(x, y, z, detect_time=detect_time):
-                self.get_logger().info(
-                    f"Target ({x * 1000.0:.1f},{y * 1000.0:.1f},{z * 1000.0:.1f}) mm "
-                    f"queued as next pick (state={self._fsm.state})"
-                )
+            self.get_logger().info(
+                f"Target ({x * 1000.0:.1f},{y * 1000.0:.1f},{z * 1000.0:.1f}) mm "
+                f"queued as next pick (state={self._fsm.state})"
+            )
 
-    def _send_target_to_matlab(self, x_m: float, y_m: float, z_m: float) -> None:
+    def _publish_target_committed(self, x_m: float, y_m: float, z_m: float) -> None:
         """Convert EE-tip metres to platform-frame mm and publish DeltaTarget
-        to MATLAB. Called by the FSM both for a freshly-accepted target and
+        telemetry for the target this node has committed to and is solving/
+        executing. Called by the FSM both for a freshly-accepted target and
         for one chained straight from PLACING into the next pick."""
         x_mm = float(x_m) * 1000.0
         y_mm = float(y_m) * 1000.0
@@ -710,20 +619,11 @@ class MatlabBridgeNode(Node):
         out.header.frame_id = "robot_base"
         out.x_mm            = x_mm
         out.y_mm            = y_mm
-        out.z_mm            = z_platform_mm   # platform Z — what the IK solver needs
+        out.z_mm            = z_platform_mm   # platform Z — what the IK solver used
         out.confidence      = -1.0
         out.track_id        = -1
         out.detection_mode  = config.DETECTION_MODE
-        self._pub_to_matlab.publish(out)
-
-    def _on_joint_angles(self, msg: DeltaJointAngles) -> None:
-        self.get_logger().info(
-            f"MATLAB reply: θ=({msg.theta1_deg:.2f},{msg.theta2_deg:.2f},"
-            f"{msg.theta3_deg:.2f})° ik_valid={msg.ik_valid}"
-        )
-        self._fsm.on_matlab_reply(
-            msg.theta1_deg, msg.theta2_deg, msg.theta3_deg, msg.ik_valid
-        )
+        self._pub_target_committed.publish(out)
 
     # ── depth camera callbacks (unused — no depth stream) ───────────────────
 
@@ -874,7 +774,7 @@ class MatlabBridgeNode(Node):
         self._pub_gripper_cmd.publish(m)
 
     def _send_motor_thetas(self, fb_deg, ok: bool) -> None:
-        """Publish actual motor-encoder thetas (CAN feedback) back to MATLAB."""
+        """Publish actual motor-encoder thetas (CAN feedback) as telemetry."""
         if fb_deg is None:
             return
         m = DeltaJointAngles()
@@ -935,9 +835,7 @@ class MatlabBridgeNode(Node):
             ok, x, y, z = solve_fk_mm(*fb_deg)   # platform mm
             if ok:
                 self._send_fk(x, y, z)
-                # /delta/ee_position_mm — EE-tip coordinates in mm.
-                # MATLAB's predict_target block subscribes here; without this
-                # publisher the block holds zero forever in bridge mode.
+                # /delta/ee_position_mm — EE-tip coordinates in mm, telemetry.
                 pt = PointStamped()
                 pt.header.stamp    = self.get_clock().now().to_msg()
                 pt.header.frame_id = "robot_base"
@@ -966,7 +864,7 @@ class MatlabBridgeNode(Node):
 def main(args=None):
     import signal
     rclpy.init(args=args)
-    node = MatlabBridgeNode()
+    node = PickPlaceNode()
 
     def handle_sigint(*_):
         node.get_logger().info("Ctrl+C — shutting down cleanly")

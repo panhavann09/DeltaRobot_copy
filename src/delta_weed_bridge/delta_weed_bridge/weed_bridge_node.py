@@ -6,8 +6,8 @@ delta_camera_system's orange-cube detector for weed picking.
 
 Publishes the exact same topics/types camera_system.py already publishes
 (/delta/target_xyz, /delta/all_targets, /delta/detection_status,
-/delta/object_velocity_mm_s) so matlab_bridge_node.py / main_app.py /
-blind_pick_place.py need no changes. Reuses delta_common.camera_geometry
+/delta/object_velocity_mm_s) so pick_place_node.py / blind_pick_place.py
+need no changes. Reuses delta_common.camera_geometry
 (the camera->base transform and IK-feasibility gate extracted from
 camera_system.py) as the single source of truth for that math.
 
@@ -92,7 +92,7 @@ class WeedBridgeNode(Node):
                 TrackedPlantArray, config.TRACKED_PLANTS_TOPIC, self._on_tracked_plants, 10
             )
         self.create_service(Trigger, "/delta/calibrate_cam_offset", self._calibrate_offset_srv)
-        # Published by matlab_bridge_node.py (mm, robot base frame) — FK fallback
+        # Published by pick_place_node.py (mm, robot base frame) — FK fallback
         # for the EE marker when the laser dot isn't visible, same as camera_system.py.
         self.create_subscription(PointStamped, "/delta/ee_fk_xyz", self._on_ee_fk, 10)
 

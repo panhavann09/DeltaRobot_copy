@@ -5,7 +5,7 @@ detects, camera-only, for manually comparing against a tape measure.
 
 Subscribes to /delta/all_targets exactly the way test1.py does (same
 topic, same metres→mm conversion, same EE-tip Z convention) and just
-prints what comes in — no MATLAB, no motors, no calibration math beyond
+prints what comes in — no motors, no calibration math beyond
 what delta_camera_system already applied.
 
 How to use

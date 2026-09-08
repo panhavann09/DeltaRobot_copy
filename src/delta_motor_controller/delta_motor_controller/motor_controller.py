@@ -190,7 +190,7 @@ class DeltaMotorController:
         return err < self.POS_TOL_MM, ik_deg, fb_deg, fk_xyz, err
 
     def move_thetas(self, t1: float, t2: float, t3: float, verify_delay: float = None):
-        """Command motors to joint angles supplied by an external IK source (e.g. MATLAB).
+        """Command motors to already-solved joint angles (e.g. from delta_common.fk_ik.solve_ik_mm).
 
         Bypasses the internal IK solver. Joint limits are still enforced.
 

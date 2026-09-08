@@ -1,13 +1,9 @@
-# DeltaTarget — RealSense detection result forwarded to MATLAB IK solver
-# Published on /delta/matlab/target_xyz by the matlab_bridge_node.
+# DeltaTarget — camera detection result committed to by the pick-place node.
+# Published on /delta/target_committed by pick_place_node (telemetry) and
+# used as a convenient test-injection format by kinematics_test_node.
 #
 # All positions are in the robot base frame (mm).
 # Z is EE-tip depth (negative = below base plane).
-#
-# MATLAB example:
-#   sub = ros2subscriber(node, "/delta/matlab/target_xyz", "custom_messages/DeltaTarget");
-#   msg = receive(sub, 5);
-#   [t1,t2,t3] = my_delta_ik(msg.x_mm, msg.y_mm, msg.z_mm);
 
 std_msgs/Header header
 

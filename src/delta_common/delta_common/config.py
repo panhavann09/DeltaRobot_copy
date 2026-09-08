@@ -226,13 +226,10 @@ CONVEYOR_BELT_SPEED_MM_S = 500.0   # mm/s — 0.5 m/s tractor ground speed
 CONVEYOR_VX_MIN_MM_S =  1.0    # below this → belt probably stopped, use 0
 CONVEYOR_VX_MAX_MM_S = 600.0   # above this → regression outlier, clamp to design speed
 
-# False: matlab_bridge_node.py grips the raw detected/depth-smoothed object
+# False: pick_place_node.py grips the raw detected/depth-smoothed object
 # pose directly — no belt-velocity lead compensation, no travel/descend timing
 # offset. For bench-testing pure Cartesian pick accuracy without conveyor
 # motion in the loop. True restores the BeltPredictor lead correction.
-# Disabled 2026-07-22: switching matlab_bridge_node.py back to USE_MATLAB=True
-# (real MATLAB IK round-trip) — testing that path on its own first, without
-# belt-lead compensation stacked on top.
 BELT_PREDICTION_ENABLE = False
 
 # Minimum seconds between consecutive target publishes to avoid flooding the robot.

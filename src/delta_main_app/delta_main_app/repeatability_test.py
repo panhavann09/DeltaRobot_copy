@@ -17,7 +17,7 @@ Paper's experiment
         Fig 15 — end-effector XY scatter + 2σ ellipse, per position
         Fig 16 — θ vs time (experiment=blue vs IK=red) for whole sequence
 
-Run directly — no ROS launch needed, no camera/main_app/matlab_bridge_node
+Run directly — no ROS launch needed, no camera/pick_place_node
 required (this script drives the arm itself via DeltaMotorController):
     python3 repeatability_test.py --run-label static
     python3 repeatability_test.py --run-label moving

@@ -14,12 +14,12 @@ Drive it with `ros2 param set` or rqt_reconfigure, e.g.:
 By default this only drives the RViz model. Pass the `drive_real_motors`
 parameter to also mirror theta1/2/3_deg onto the real robot over CAN — this
 turns the node into a standalone manual jog tool, isolated from
-delta_main_app (no camera, no MATLAB, no pick/place logic):
+delta_main_app (no camera, no pick/place logic):
     ros2 launch delta_description view_delta.launch.py \
         enable_camera:=false drive_real_motors:=true
 
-Do NOT run with drive_real_motors:=true at the same time as main_app or
-matlab_bridge_node — they'd all open can1 and fight over the same motors.
+Do NOT run with drive_real_motors:=true at the same time as
+pick_place_node — it would also open can1 and fight over the same motors.
 Connecting homes the real robot to theta=(0,0,0) immediately (motor_controller's
 init_zero()), matching this node's own default RViz pose.
 
@@ -83,7 +83,7 @@ class JointStateBridge(Node):
             self._ctrl.connect()   # also homes to theta=(0,0,0) via init_zero()
             self.get_logger().warn(
                 "drive_real_motors=True — the real robot will physically follow "
-                "theta1/2/3_deg. Make sure nothing else (main_app, matlab_bridge_node) "
+                "theta1/2/3_deg. Make sure nothing else (pick_place_node) "
                 "is holding can1.")
         else:
             self.get_logger().info("Visualization only — no CAN connection opened.")
@@ -124,7 +124,7 @@ class JointStateBridge(Node):
         if busy:
             # A jog is mid-settle and already polling CAN in its own thread —
             # reading feedback here too would steal its response frame (same
-            # hazard matlab_bridge_node.py guards against). It republishes
+            # hazard pick_place_node.py guards against). It republishes
             # fresh real feedback itself the moment it settles, so just hold
             # the last published pose until then.
             return

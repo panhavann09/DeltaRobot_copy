@@ -663,7 +663,7 @@ class DeltaCamera(Node):
                     if not hasattr(self, '_laser_err_buf'):
                         # Short window (was 10): after every move the raw error
                         # jumps enough to clear this buffer (see reset check
-                        # below), and WAITING_ALIGN in matlab_bridge_node.py
+                        # below), and WAITING_ALIGN in pick_place_node.py
                         # blocks on it converging — a 10-frame refill was the
                         # dominant source of post-move grip delay.
                         self._laser_err_buf = deque(maxlen=3)

@@ -13,7 +13,7 @@ setup(
         ('share/' + package_name + '/launch', [
             'launch/delta_main.launch.py',
             'launch/blind_pick_place.launch.py',
-            'launch/matlab_bridge.launch.py',
+            'launch/pick_place.launch.py',
             'launch/weed_pick_place.launch.py',
         ]),
     ],
@@ -25,15 +25,13 @@ setup(
     license='Apache License 2.0',
     entry_points={
         'console_scripts': [
-            'main_app             = delta_main_app.main_app:main',
             'blind_pick_place     = delta_main_app.blind_pick_place:main',
             'pick_place_ui        = delta_main_app.pick_place_ui:main',
             'laser_accuracy_experiment = delta_main_app.laser_accuracy_experiment:main',
             'analyze_repeatability     = delta_main_app.analyze_repeatability:main',
             'laser_preview             = delta_main_app.laser_preview:main',
             'repeatability_test        = delta_main_app.repeatability_test:main',
-            'workspace_accuracy_sweep  = delta_main_app.workspace_accuracy_sweep:main',
-            'matlab_bridge            = delta_main_app.matlab_bridge_node:main',
+            'pick_place               = delta_main_app.pick_place_node:main',
             'test1                    = delta_main_app.test1:main',
             'check_cube_detection_accuracy = delta_main_app.check_cube_detection_accuracy:main',
             'camera_detection_monitor      = delta_main_app.camera_detection_monitor:main',

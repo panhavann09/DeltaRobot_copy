@@ -19,7 +19,7 @@ robot chase it.
 Run this ALONGSIDE a node that publishes the color/camera_info topics
 (delta_camera_system's camera_system.launch.py, or delta_weed_bridge's
 weed_bridge.launch.py — either works, this node only subscribes). Do NOT run
-this at the same time as kinematics_test_node or matlab_bridge_node (or
+this at the same time as kinematics_test_node or pick_place_node (or
 anything else that opens its own DeltaMotorController) — only one process
 may hold the CAN connection to the motors at a time.
 """

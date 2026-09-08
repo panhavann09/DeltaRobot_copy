@@ -20,7 +20,6 @@ setup(
     entry_points={
         'console_scripts': [
             'valve_can_node=delta_motor_controller.valve_can_node:main',
-            'matlab_joint_sub_node=delta_motor_controller.matlab_joint_sub_node:main',
             'kinematics_test_node=delta_motor_controller.kinematics_test_node:main',
             'gripper_cli=delta_motor_controller.gripper_cli:main',
             'laser_teleop_node=delta_motor_controller.laser_teleop_node:main',

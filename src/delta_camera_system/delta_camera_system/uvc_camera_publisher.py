@@ -1,7 +1,7 @@
 """Standalone replacement for realsense2_camera_node — publishes color +
 camera_info from a UVC/V4L2 global-shutter camera on the same topics the
 RealSense ROS driver used, so downstream nodes (camera_system.py,
-matlab_bridge_node.py, weed_bridge_node.py, RViz) need no changes.
+pick_place_node.py, weed_bridge_node.py, RViz) need no changes.
 
 This camera has no depth stream, so /camera/camera/aligned_depth_to_color/
 image_raw is simply never published — consumers already handle a missing

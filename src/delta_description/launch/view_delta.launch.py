@@ -16,8 +16,8 @@ Disable with `enable_camera:=false` if you just want the arm model.
 
 Pass `drive_real_motors:=true` to also mirror theta1/2/3_deg onto the real
 robot over CAN (joint_state_bridge then doubles as a standalone manual jog
-tool). Do NOT combine with delta_main_app/matlab_bridge_node running at the
-same time — they'd all fight over can1.
+tool). Do NOT combine with delta_main_app/pick_place_node running at the
+same time — they'd both fight over can1.
 """
 import os
 
