@@ -15,6 +15,7 @@ setup(
             'launch/blind_pick_place.launch.py',
             'launch/pick_place.launch.py',
             'launch/weed_pick_place.launch.py',
+            'launch/weed_pick_place_realsense.launch.py',
         ]),
     ],
     install_requires=['setuptools'],
