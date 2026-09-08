@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>trt_engine_builder</name>
+  <version>0.0.0</version>
+  <description>trtexec wrapper for exporting a device-local TensorRT .engine from an ONNX model. Build-time only — no ROS nodes/topics; run once per target device (e.g. Jetson Xavier) whenever the model changes, since a .engine built on one GPU architecture/TensorRT version will not load on another.</description>
+
+  <maintainer email="s4mb4th@todo.todo">s4mb4th</maintainer>
+  <license>Apache License 2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>python3</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
