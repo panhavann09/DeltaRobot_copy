@@ -7,12 +7,12 @@
 //
 // Code generated for Simulink model 'sim4_ROS2_delta'.
 //
-// Model version                  : 1.230
+// Model version                  : 1.367
 // Simulink Coder version         : 25.2 (R2025b) 28-Jul-2025
-// C/C++ source code generated on : Thu Jul  2 13:41:44 2026
+// C/C++ source code generated on : Sat Aug 22 08:20:52 2026
 //
 // Target selection: ert.tlc
-// Embedded hardware selection: AMD->x86-64 (Windows64)
+// Embedded hardware selection: ARM Compatible->ARM Cortex-A (64-bit)
 // Code generation objectives: Unspecified
 // Validation result: Not run
 //

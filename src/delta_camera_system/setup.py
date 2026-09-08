@@ -23,9 +23,10 @@ setup(
     entry_points={
         'console_scripts': [
             'camera_node = delta_camera_system.camera_system:main',
-            'realsense_publisher = delta_camera_system.realsense_publisher:main',
+            'uvc_camera_publisher = delta_camera_system.uvc_camera_publisher:main',
             'calibrate_camera_transform = delta_camera_system.calibrate_transform:main',
             'calibrate_plane_homography = delta_camera_system.calibrate_plane_homography:main',
+            'calibrate_camera_intrinsics = delta_camera_system.calibrate_intrinsics:main',
         ],
     },
 )

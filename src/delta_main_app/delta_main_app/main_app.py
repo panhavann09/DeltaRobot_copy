@@ -30,10 +30,11 @@ import threading
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PointStamped, PoseArray
+from sensor_msgs.msg import JointState
 from std_msgs.msg import Float32, String
 
 from delta_common import config
-from delta_common.fk_ik import check_workspace, delta_calcInverse, e, f, re, rf
+from delta_common.fk_ik import JOINT_NAMES, DeltaGeometry, check_workspace, joint_state, solve_fk_mm, solve_ik_mm
 from delta_motor_controller.motor_controller import DeltaMotorController
 from delta_motor_controller.pneumatic_gripper import PneumaticGripper
 from delta_main_app.belt_predictor import BeltPredictor
@@ -50,6 +51,9 @@ HOME_Z = config.HOME_Z
 GRASP_WAIT_SEC = 0.4
 DROP_WAIT_SEC = 0.4
 MOVE_SETTLE_SEC = 0.05
+
+LASER_ALIGN_TIMEOUT_S = 1.0   # max time to wait for laser-to-object alignment before grip
+LASER_ERROR_MAX_AGE_S = 1.0   # discard /delta/laser_error_mm readings older than this
 
 CONFIRM_FRAMES = 2
 STABLE_THRESH_MM = 10.0
@@ -94,6 +98,7 @@ class PickAndPlaceStateMachine:
         state_pub,
         logger,
         get_next_pick_xy=None,
+        get_laser_error_fn=None,
     ):
         self._ctrl = controller
         self._gripper_pub = gripper_pub
@@ -101,6 +106,7 @@ class PickAndPlaceStateMachine:
         self._log = logger
         self._state = "IDLE"
         self._get_next_pick_xy = get_next_pick_xy
+        self._get_laser_error = get_laser_error_fn   # fn() -> (dx, dy, tol_mm, age_s) | None
 
         self._recent_xyz = []
         self._target_xyz = None
@@ -110,10 +116,10 @@ class PickAndPlaceStateMachine:
         self._ee_error_y = None
 
     @property
-    def current_pick_x(self):
-        """X of the object currently being picked, or None when idle."""
+    def current_pick_y(self):
+        """Y (lateral, stable) of the object currently being picked, or None when idle."""
         with self._lock:
-            return self._target_xyz[0] if self._target_xyz else None
+            return self._target_xyz[1] if self._target_xyz else None
 
     def detection_update(self, x: float, y: float, z: float) -> None:
         with self._lock:
@@ -160,8 +166,8 @@ class PickAndPlaceStateMachine:
         ):
             # home uses raw platform Z; others are EE-tip Z that need offset conversion
             cz = cz_ee if label == "home" else cz_ee + ee_off
-            st, t1, t2, t3 = delta_calcInverse(cx, cy, cz, e, f, re, rf)
-            if st == 0:
+            ok, t1, t2, t3 = solve_ik_mm(cx, cy, cz)
+            if ok:
                 self._log.info(
                     f"IK pre-check {label}: ({cx:.1f},{cy:.1f},{cz:.1f})"
                     f" → OK t=({t1:.1f},{t2:.1f},{t3:.1f})"
@@ -245,20 +251,42 @@ class PickAndPlaceStateMachine:
         n = len(samples_x)
         return samples_x[n // 2], samples_y[n // 2]
 
+    def _wait_for_laser_alignment(self, timeout=LASER_ALIGN_TIMEOUT_S):
+        """Poll /delta/laser_error_mm until the laser dot lands within its
+        tolerance radius of the object, or timeout elapses.
+
+        Returns (aligned, dist_mm).  If no laser feedback is wired up
+        (get_laser_error_fn=None), alignment is skipped and treated as OK so
+        deployments without the laser configured keep picking unconditionally.
+        """
+        if self._get_laser_error is None:
+            return True, None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            reading = self._get_laser_error()
+            if reading is not None:
+                dx, dy, tol_mm, age_s = reading
+                if age_s <= LASER_ERROR_MAX_AGE_S:
+                    dist = math.hypot(dx, dy)
+                    if dist <= tol_mm:
+                        return True, dist
+            time.sleep(0.02)
+        return False, None
+
     def _start_sequence(self) -> None:
         self._busy = True
         threading.Thread(target=self._run_sequence, daemon=True).start()
 
     def _run_sequence(self) -> None:
-        from delta_common.fk_ik import delta_calcInverse, e, f, re, rf
+        from delta_common.fk_ik import solve_ik_mm
 
         x, y, z = self._target_xyz
         z_platform = z + config.EE_OFFSET_Z_MM   # EE-tip → platform Z for all moves
         az = _approach_z(z_platform)
         lz = _lift_z(z_platform)
 
-        st_az, *_ = delta_calcInverse(x, y, az, e, f, re, rf)
-        use_approach = (st_az == 0)
+        ok_az, *_ = solve_ik_mm(x, y, az)
+        use_approach = ok_az
         if not use_approach:
             self._log.warn(
                 f"Approach Z={az:.1f} unreachable at XY=({x:.1f},{y:.1f}) "
@@ -278,23 +306,23 @@ class PickAndPlaceStateMachine:
                 time.sleep(MOVE_SETTLE_SEC)
 
                 # ── Dynamic arrival gate ─────────────────────────────────────
-                # Wait at approach Z until the object is under the EE in Y
-                # (|err_y| < threshold).  This replaces the fixed approach wait
+                # Wait at approach Z until the object is under the EE in X
+                # (|err_x| < threshold).  This replaces the fixed approach wait
                 # and adapts automatically to belt speed variation.
                 if config.CONVEYOR_MODE and config.EE_CORRECTION_ENABLE:
                     deadline_arr = time.time() + config.CONVEYOR_ARRIVAL_TIMEOUT_S
                     no_signal = 0
                     while time.time() < deadline_arr:
-                        _, ey = self._wait_fresh_ee_error(timeout=0.1)
-                        if ey is None:
+                        ex, _ = self._wait_fresh_ee_error(timeout=0.1)
+                        if ex is None:
                             no_signal += 1
                             if no_signal >= 5:
                                 self._log.warn("Arrival gate: no EE signal — proceeding")
                                 break
                             continue
                         no_signal = 0
-                        self._log.info(f"Arrival wait: err_y={ey:+.1f}mm")
-                        if abs(ey) < config.CONVEYOR_ARRIVAL_Y_THRESH_MM:
+                        self._log.info(f"Arrival wait: err_x={ex:+.1f}mm")
+                        if abs(ex) < config.CONVEYOR_ARRIVAL_X_THRESH_MM:
                             self._log.info("Object arrived under EE")
                             break
                 elif config.CONVEYOR_APPROACH_WAIT_SEC > 0:
@@ -318,8 +346,8 @@ class PickAndPlaceStateMachine:
                             break
 
                         dist_2d = math.sqrt(err_x**2 + err_y**2)
-                        # On conveyor, belt predictor owns Y timing — only correct X.
-                        check_err = abs(err_x) if config.CONVEYOR_MODE else dist_2d
+                        # On conveyor, belt predictor owns X timing — only correct Y.
+                        check_err = abs(err_y) if config.CONVEYOR_MODE else dist_2d
                         self._log.info(
                             f"Correction iter {i}: "
                             f"err_x={err_x:+.1f}mm err_y={err_y:+.1f}mm "
@@ -338,9 +366,9 @@ class PickAndPlaceStateMachine:
                             self._log.warn("Correction timeout — proceeding")
                             break
 
-                        x_new = x - err_x * config.EE_CORRECTION_GAIN
-                        # Y correction disabled in conveyor mode — belt predictor handles timing
-                        y_new = y if config.CONVEYOR_MODE else y + err_y * config.EE_CORRECTION_GAIN
+                        # X correction disabled in conveyor mode — belt predictor handles timing
+                        x_new = x if config.CONVEYOR_MODE else x - err_x * config.EE_CORRECTION_GAIN
+                        y_new = y - err_y * config.EE_CORRECTION_GAIN
 
                         x_new = max(-config.X_LIMIT + 5.0,
                                 min( config.X_LIMIT - 5.0, x_new))
@@ -361,6 +389,15 @@ class PickAndPlaceStateMachine:
             if not self._move(x, y, pick_z):
                 raise RuntimeError("PICK descend failed")
             time.sleep(MOVE_SETTLE_SEC)
+
+            aligned, dist = self._wait_for_laser_alignment()
+            if not aligned:
+                raise RuntimeError(
+                    f"Laser not aligned with object after "
+                    f"{LASER_ALIGN_TIMEOUT_S:.1f}s — aborting grip"
+                )
+            if dist is not None:
+                self._log.info(f"Laser aligned (dist={dist:.1f}mm) — gripping")
 
             self._set_state("GRASPING")
             self._gripper(1.0)
@@ -423,10 +460,10 @@ class PickAndPlaceStateMachine:
                 self._log.info("Sequence complete - IDLE")
 
     def _move(self, x: float, y: float, z: float, raw: bool = False) -> bool:
-        from delta_common.fk_ik import delta_calcInverse, e, f, re, rf
+        from delta_common.fk_ik import solve_ik_mm
 
-        st, t1, t2, t3 = delta_calcInverse(x, y, z, e, f, re, rf)
-        if st != 0:
+        ok, t1, t2, t3 = solve_ik_mm(x, y, z)
+        if not ok:
             self._log.error(f"IK no solution for ({x:.1f}, {y:.1f}, {z:.1f})")
             return False
         if t1 < 0 or t2 < 0 or t3 < 0:
@@ -443,7 +480,13 @@ class PickAndPlaceStateMachine:
         ok, _, _, _, err = self._ctrl.move_xyz(x, y, z, raw=raw)
         if ok:
             self._log.info(f"  FK err={err:.2f} mm  OK")
-            self._current_ee_xyz = (x, y, z - config.EE_OFFSET_Z_MM)
+            # raw=True: (x,y,z) is already the platform target -> tip = z - offset.
+            # raw=False: move_xyz added EE_OFFSET_Z_MM internally to convert this
+            # tip-frame (x,y,z) into the platform target, so z itself IS the tip.
+            if raw:
+                self._current_ee_xyz = (x, y, z - config.EE_OFFSET_Z_MM)
+            else:
+                self._current_ee_xyz = (x, y, z)
         else:
             self._log.warn("  Move FAILED")
         return ok
@@ -467,7 +510,7 @@ class DeltaMainApp(Node):
 
         self._explicit_shutdown = False   # True only on intentional Ctrl+C
         self._ctrl = DeltaMotorController(
-            can_port="can0",
+            can_port="can1",
             vel_max=config.MOTOR_VEL_MAX,
             acc_set=config.MOTOR_ACC_SET,
         )
@@ -480,7 +523,7 @@ class DeltaMainApp(Node):
         self._gripper_pub = self.create_publisher(Float32, "/delta/gripper_cmd", 10)
         self._state_pub = self.create_publisher(String, "/delta/robot_state", 10)
 
-        self._gripper = PneumaticGripper(can_channel='can0', can_id=4)
+        self._gripper = PneumaticGripper(can_channel='can2', can_id=600)
         if config.ENABLE_MOTORS:
             self._gripper.connect()
             self.get_logger().info("Gripper connected (direct CAN).")
@@ -491,10 +534,11 @@ class DeltaMainApp(Node):
             state_pub=self._send_state,
             logger=self.get_logger(),
             get_next_pick_xy=self._peek_next_pick_xy,
+            get_laser_error_fn=self._get_laser_error,
         )
 
         self._target_queue: list = []
-        self._belt_vy_mm_s: float = 0.0
+        self._belt_vx_mm_s: float = 0.0
         self._queue_lock = threading.Lock()
         self._predictor = BeltPredictor()
         self._verify_deadline: float = 0.0
@@ -514,6 +558,12 @@ class DeltaMainApp(Node):
         self._sub_ee_error = self.create_subscription(
             PointStamped, "/delta/ee_error_mm", self._ee_error_callback, 10
         )
+        # Latest reading from camera_system's true laser-vs-object error
+        # (dx_mm, dy_mm, tol_mm, receipt_time) — gates the grip in PICKING.
+        self._latest_laser_error = None
+        self._sub_laser_error = self.create_subscription(
+            PointStamped, "/delta/laser_error_mm", self._on_laser_error, 10
+        )
         self._pub_ee_fk = self.create_publisher(PointStamped, "/delta/ee_fk_xyz", 10)
         self._pub_ff_target = self.create_publisher(
             PointStamped, "/delta/matlab/target_xyz_mm", 10
@@ -521,6 +571,10 @@ class DeltaMainApp(Node):
         self._pub_ff_ee = self.create_publisher(
             PointStamped, "/delta/matlab/ee_position_mm", 10
         )
+        # Real motor-encoder joint state — lets robot_state_publisher/RViz
+        # animate the URDF with the real robot's live pose.
+        self._joint_geom = DeltaGeometry()
+        self._pub_joint_states = self.create_publisher(JointState, "joint_states", 10)
         self._fsm._current_ee_xyz = None
         self.create_timer(0.1, self._queue_timer)
         self.create_timer(0.05, self._publish_ee_fk_timer)
@@ -547,6 +601,18 @@ class DeltaMainApp(Node):
         pt.point.z = float(xyz[2])
         self._pub_ee_fk.publish(pt)
 
+    def _publish_joint_states(self, fb_deg) -> None:
+        """Publish full 12-joint /joint_states from the 3 live shoulder thetas."""
+        thetas_rad = [math.radians(t) for t in fb_deg]
+        values = joint_state(self._joint_geom, thetas_rad)
+        if values is None:
+            return
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = list(JOINT_NAMES)
+        msg.position = [values[name] for name in JOINT_NAMES]
+        self._pub_joint_states.publish(msg)
+
     def _publish_feedforward_timer(self) -> None:
         now = self.get_clock().now().to_msg()
         tgt = self._fsm._target_xyz
@@ -560,7 +626,9 @@ class DeltaMainApp(Node):
             self._pub_ff_target.publish(pt)
         if config.ENABLE_MOTORS and self._ctrl.connected:
             try:
-                ok, x, y, z = self._ctrl.get_current_xyz()
+                fb_deg = self._ctrl.get_current_thetas_deg()
+                self._publish_joint_states(fb_deg)
+                ok, x, y, z = solve_fk_mm(*fb_deg)
                 if ok:
                     pt = PointStamped()
                     pt.header.stamp = now
@@ -584,6 +652,20 @@ class DeltaMainApp(Node):
             f"(n={self._ee_error_count})"
         )
 
+    def _on_laser_error(self, msg: PointStamped) -> None:
+        # point.z carries the alignment tolerance (mm), not a Z coordinate —
+        # see camera_system.py's laser_error_mm publisher.
+        self._latest_laser_error = (msg.point.x, msg.point.y, msg.point.z, time.time())
+
+    def _get_laser_error(self):
+        """Return (dx_mm, dy_mm, tol_mm, age_s) from the latest
+        /delta/laser_error_mm reading, or None if camera_system hasn't
+        published one yet."""
+        if self._latest_laser_error is None:
+            return None
+        dx, dy, tol_mm, stamp = self._latest_laser_error
+        return dx, dy, tol_mm, time.time() - stamp
+
     def _all_targets_callback(self, msg: PoseArray) -> None:
         with self._queue_lock:
             candidates = [
@@ -592,21 +674,21 @@ class DeltaMainApp(Node):
             ]
             if not candidates:
                 return
-            # Ascending Y: most advanced on belt (closest to exit) first.
-            candidates.sort(key=lambda p: p[1])
+            # Ascending X: most advanced on belt (closest to exit) first.
+            candidates.sort(key=lambda p: p[0])
             now = time.time()
 
             # Always feed the predictor — regression window must stay populated.
-            self._predictor.update_velocity(candidates[0][1], now)
+            self._predictor.update_velocity(candidates[0][0], now)
 
             # Refresh stale queue positions with fresh detections.
-            # Objects move in Y only; match existing queue items by X proximity (±25 mm)
-            # and overwrite their Y + timestamp so extrapolation stays accurate.
-            queued_xs: list = []
-            for i, (qx, _, _, _) in enumerate(self._target_queue):
-                queued_xs.append(qx)
+            # Objects move in X only; match existing queue items by Y proximity (±25 mm)
+            # and overwrite their X + timestamp so extrapolation stays accurate.
+            queued_ys: list = []
+            for i, (_, qy, _, _) in enumerate(self._target_queue):
+                queued_ys.append(qy)
                 for cx, cy, cz in candidates:
-                    if abs(cx - qx) < 25.0:
+                    if abs(cy - qy) < 25.0:
                         self._target_queue[i] = (cx, cy, cz, now)
                         break
 
@@ -621,21 +703,21 @@ class DeltaMainApp(Node):
 
             # Queue has items; add any objects newly detected that aren't in it yet,
             # excluding the one currently being picked.
-            current_x = self._fsm.current_pick_x
+            current_y = self._fsm.current_pick_y
             for cx, cy, cz in candidates:
                 if len(self._target_queue) >= 5:
                     break
-                if current_x is not None and abs(cx - current_x) < 25.0:
+                if current_y is not None and abs(cy - current_y) < 25.0:
                     continue  # this is the object currently being picked
-                if all(abs(cx - qx) >= 25.0 for qx in queued_xs):
+                if all(abs(cy - qy) >= 25.0 for qy in queued_ys):
                     self._target_queue.append((cx, cy, cz, now))
-                    queued_xs.append(cx)
+                    queued_ys.append(cy)
                     self.get_logger().info(
                         f"New object added to queue: ({cx:.1f}, {cy:.1f})"
                     )
 
     def _velocity_callback(self, msg: PointStamped) -> None:
-        self._belt_vy_mm_s = msg.point.y
+        self._belt_vx_mm_s = msg.point.x
 
     def _queue_timer(self) -> None:
         if self._homing:
@@ -645,25 +727,25 @@ class DeltaMainApp(Node):
                 return
 
             now = time.time()
-            vy = self._predictor.measured_vy
-            if vy is None:
-                vy = -config.CONVEYOR_BELT_SPEED_MM_S
+            vx = self._predictor.measured_vx
+            if vx is None:
+                vx = -config.CONVEYOR_BELT_SPEED_MM_S
 
-            # Extrapolate every queued item's Y to "now" using the belt velocity
+            # Extrapolate every queued item's X to "now" using the belt velocity
             # estimate, then drop any that have already passed through the workspace.
             fresh = []
             for qx, qy, qz, qt in self._target_queue:
-                y_now = qy + vy * (now - qt)
-                if y_now < -(config.Y_LIMIT + 20.0):
+                x_now = qx + vx * (now - qt)
+                if x_now < -(config.X_LIMIT + 20.0):
                     self.get_logger().warn(
-                        f"Object X={qx:.1f}mm exited workspace "
-                        f"(y_extrap={y_now:.1f}mm) — dropped"
+                        f"Object Y={qy:.1f}mm exited workspace "
+                        f"(x_extrap={x_now:.1f}mm) — dropped"
                     )
                     continue
-                fresh.append((qx, y_now, qz, now))
+                fresh.append((x_now, qy, qz, now))
 
-            # Re-sort: most advanced (lowest Y) first.
-            fresh.sort(key=lambda p: p[1])
+            # Re-sort: most advanced (lowest X) first.
+            fresh.sort(key=lambda p: p[0])
             self._target_queue = fresh
 
             if not self._target_queue:
@@ -676,31 +758,31 @@ class DeltaMainApp(Node):
                 f"queue_remaining={len(self._target_queue)}"
             )
 
-            result = self._predictor.predict(x, y)
-            x_pick = x
-            y_pick = result.y_pick
+            result = self._predictor.predict(y, x)
+            y_pick = y
+            x_pick = result.x_pick
             if not result.valid:
                 # Object is in approach zone — predicted pick still outside workspace.
                 # Pre-position at workspace boundary now; arrival gate holds until object arrives.
-                if y > config.Y_LIMIT and abs(x) <= config.X_LIMIT:
-                    y_pick = config.Y_LIMIT - 5.0
+                if x > config.X_LIMIT and abs(y) <= config.Y_LIMIT:
+                    x_pick = config.X_LIMIT - 5.0
                     self.get_logger().info(
-                        f"Approach zone: pre-positioning at Y={y_pick:.1f}mm "
-                        f"(object at Y={y:.1f}, predicted Y={result.y_pick:.1f})"
+                        f"Approach zone: pre-positioning at X={x_pick:.1f}mm "
+                        f"(object at X={x:.1f}, predicted X={result.x_pick:.1f})"
                     )
                 else:
                     self.get_logger().warn(
-                        f"Predicted pick ({x:.1f}, {result.y_pick:.1f}) outside workspace — skipped"
+                        f"Predicted pick ({result.x_pick:.1f}, {y:.1f}) outside workspace — skipped"
                     )
                     return
-            elif not check_workspace(x, y_pick, z + config.EE_OFFSET_Z_MM):
+            elif not check_workspace(x_pick, y, z + config.EE_OFFSET_Z_MM):
                 self.get_logger().warn(
-                    f"Predicted pick ({x:.1f}, {y_pick:.1f}, {z:.1f}) outside workspace — skipped"
+                    f"Predicted pick ({x_pick:.1f}, {y:.1f}, {z:.1f}) outside workspace — skipped"
                 )
                 return
             self.get_logger().info(
                 f"Pre-position target: ({x_pick:.1f}, {y_pick:.1f}, {z:.1f}) mm  "
-                f"vy={result.vy_mm_s:.1f} mm/s  offset={result.belt_offset:.1f} mm  "
+                f"vx={result.vx_mm_s:.1f} mm/s  offset={result.belt_offset:.1f} mm  "
                 f"t={result.t_total:.2f} s"
             )
             self._check_belt_verify()
@@ -745,13 +827,13 @@ class DeltaMainApp(Node):
         if self._verify_deadline == 0.0 or time.time() < self._verify_deadline:
             return
         self._verify_deadline = 0.0
-        vy = self._predictor.measured_vy
-        if vy is None:
+        vx = self._predictor.measured_vx
+        if vx is None:
             self.get_logger().warn(
                 "Belt verify: not enough samples — no objects detected during window?"
             )
             return
-        measured = abs(vy)
+        measured = abs(vx)
         expected = config.CONVEYOR_BELT_SPEED_MM_S
         diff = abs(measured - expected)
         status = "WARNING" if diff > 1.0 else "OK"
@@ -770,19 +852,19 @@ class DeltaMainApp(Node):
             self.get_logger().info(msg)
 
     def _peek_next_pick_xy(self):
-        """Return (x, y_predicted) of the next queued object, or None.
+        """Return (x_predicted, y) of the next queued object, or None.
         Called by the FSM during RESETTING so it can pre-position toward the
         next pick instead of returning to the centre home position."""
         with self._queue_lock:
             if not self._target_queue:
                 return None
             qx, qy, _, qt = self._target_queue[0]
-            vy = self._predictor.measured_vy or -config.CONVEYOR_BELT_SPEED_MM_S
-            y_now = qy + vy * (time.time() - qt)
-            result = self._predictor.predict(qx, y_now)
+            vx = self._predictor.measured_vx or -config.CONVEYOR_BELT_SPEED_MM_S
+            x_now = qx + vx * (time.time() - qt)
+            result = self._predictor.predict(qy, x_now)
             # Clamp to workspace so the IK always succeeds for the pre-position move.
-            x_pre = max(-config.X_LIMIT + 5.0, min(config.X_LIMIT - 5.0, qx))
-            y_pre = max(-config.Y_LIMIT + 5.0, min(config.Y_LIMIT - 5.0, result.y_pick))
+            y_pre = max(-config.Y_LIMIT + 5.0, min(config.Y_LIMIT - 5.0, qy))
+            x_pre = max(-config.X_LIMIT + 5.0, min(config.X_LIMIT - 5.0, result.x_pick))
             return (x_pre, y_pre)
 
     def _startup_home(self) -> None:

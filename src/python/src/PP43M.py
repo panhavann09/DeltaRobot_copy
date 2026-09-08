@@ -15,7 +15,7 @@ except ImportError:
     from protocol import ParameterType
 
 # ---------------- CONFIG ----------------
-CAN_PORT = "can0"
+CAN_PORT = "can1"
 
 MOTOR_IDS = [1, 2, 3]
 MOTOR_NAMES = [f"motor_{mid}" for mid in MOTOR_IDS]

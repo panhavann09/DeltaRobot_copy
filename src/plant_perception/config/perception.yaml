@@ -1,0 +1,55 @@
+# YOLO-Seg-Root perception node parameters
+plant_perception_node:
+  ros__parameters:
+    # Detection
+    model_path: "src/weight/best.engine"
+    imgsz: 640
+    conf_thres: 0.25
+    iou_thres: 0.45
+    device: "tensorrt"
+    trt_fp16_enable: false
+    target_fps: 30.0
+
+    # Tracking
+    tracker_type: "bytetrack"
+    track_high_thresh: 0.35
+    track_low_thresh: 0.10
+    new_track_thresh: 0.40
+    track_buffer: 15
+    match_thresh: 0.75
+    frame_rate: 15
+
+    # Track stability
+    minimum_confirm_hits: 3
+    maximum_publish_misses: 2
+    maximum_track_misses: 15
+    bbox_ema_alpha: 0.50
+    root_ema_alpha: 0.35
+    class_history_size: 5
+
+    # Segmentation
+    publish_masks: false
+
+    # Depth
+    use_depth: true
+    depth_window_size: 7
+    minimum_depth_valid_ratio: 0.40
+    minimum_depth_m: 0.10
+    maximum_depth_m: 3.00
+    depth_mad_multiplier: 2.5
+    depth_history_size: 5
+
+    # Synchronization
+    sync_slop_seconds: 0.15
+    sync_queue_size: 30
+
+    # Visualization
+    enable_visualization: true
+    visualization_show_masks: false
+    visualization_jpeg_quality: 80
+
+    # Topics
+    color_image_topic: "/camera/camera/color/image_raw"
+    depth_image_topic: "/camera/camera/aligned_depth_to_color/image_raw"
+    tracked_plants_topic: "/plant_perception/tracked_plants"
+    visualization_topic: "/plant_perception/visualization"

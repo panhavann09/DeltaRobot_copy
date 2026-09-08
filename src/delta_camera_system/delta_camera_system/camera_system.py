@@ -19,8 +19,8 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from ultralytics import YOLO
 
-from delta_common import config
-from delta_common.fk_ik import delta_calcForward, delta_calcInverse, e, f, re, rf
+from delta_common import config, camera_geometry, workspace_overlay
+from delta_common.ee_marker import EEMarkerDetector
 
 
 class DeltaCamera(Node):
@@ -87,9 +87,15 @@ class DeltaCamera(Node):
         self._pub_all_targets = self.create_publisher(PoseArray,    "/delta/all_targets",          10)
         self._pub_ee_pos      = self.create_publisher(PointStamped, "/delta/ee_position_mm",       10)
         self._pub_ee_error    = self.create_publisher(PointStamped, "/delta/ee_error_mm",          10)
+        self._pub_laser_error = self.create_publisher(PointStamped, "/delta/laser_error_mm",       10)
+        # Position of each individual detection that is CONVEYOR_OK this frame —
+        # lets subscribers confirm it's THEIR target that entered the workspace,
+        # not just that some object somewhere did (see workspace_entry_xyz below).
+        self._pub_workspace_entry = self.create_publisher(PointStamped, "/delta/workspace_entry_xyz", 10)
         self.create_service(Trigger, "/delta/calibrate_cam_offset", self._calibrate_offset_srv)
         self._ee_fk_pixel = None
         self._ee_fk_xyz = None   # FK position in base frame (ground truth for ee_position_mm)
+        self._ee_marker = EEMarkerDetector()
         self.create_subscription(
             PointStamped, "/delta/ee_fk_xyz", self._ee_fk_callback, 10
         )
@@ -156,7 +162,6 @@ class DeltaCamera(Node):
         if best is not None:
             self.maybe_print_result(best)
             self.fake_motor_command(best)
-            self._collect_cal_sample(best)
 
         if self.VIEW_IMAGE:
             self._draw_perf_overlay(annotated)
@@ -198,6 +203,18 @@ class DeltaCamera(Node):
                 cv2.circle(annotated, (eu, ev), 6, (255, 255, 0), 2)
                 cv2.putText(annotated, "EE", (eu + 8, ev),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.25, (255, 255, 0), 1)
+
+        # Cam-offset calibration: sample the laser/EE-marker pixel directly
+        # (not the generic object detector) so /delta/calibrate_cam_offset
+        # works with the laser fixed at true center, no object needed.
+        # Only valid while the marker sits at belt depth (config.FAKE_DEPTH_M)
+        # — see the note above on why laser-pixel + FAKE_DEPTH_M is wrong at
+        # any other EE height.
+        if self._cal_active and ee_uv is not None:
+            laser_xyz_cam = self.pixel_to_camera_xyz_mm(eu, ev, config.FAKE_DEPTH_M)
+            if laser_xyz_cam is not None:
+                laser_x_base, laser_y_base, _ = self.camera_to_base_mm(*laser_xyz_cam)
+                self._collect_cal_sample({"x_base": laser_x_base, "y_base": laser_y_base})
 
         # Publish EE position from FK (ground truth) rather than laser pixel projection.
         # Laser projection uses FAKE_DEPTH_M calibrated for the belt, not the EE depth.
@@ -296,10 +313,16 @@ class DeltaCamera(Node):
                 for corner in np.round(corners_uv).astype(np.int32):
                     cv2.circle(annotated, tuple(corner.tolist()), 4, (0, 255, 255), -1)
 
-            z_real = self.get_depth_meters(depth_image, u, v, x1, y1, x2, y2, track_id, contour)
-            z_m = z_real if z_real is not None else config.FAKE_DEPTH_M
+            if config.FAKE_DEPTH_ENABLE:
+                z_m = config.FAKE_DEPTH_M
+            else:
+                z_real = self.get_depth_meters(depth_image, u, v, x1, y1, x2, y2, track_id, contour)
+                if z_real is None:
+                    print(f"DROP: conf={conf:.2f} pixel=({u},{v}) no real depth, fake depth disabled")
+                    continue
+                z_m = z_real
 
-            print(f"DETECT: conf={conf:.2f} pixel=({u},{v}) depth={'real' if z_real is not None else 'fake'}={z_m*1000:.0f}mm")
+            print(f"DETECT: conf={conf:.2f} pixel=({u},{v}) depth={'fake' if config.FAKE_DEPTH_ENABLE else 'real'}={z_m*1000:.0f}mm")
 
             xyz_cam = self.pixel_to_camera_xyz_mm(u, v, z_m)
             if xyz_cam is None:
@@ -330,12 +353,15 @@ class DeltaCamera(Node):
             # Convert EE-tip Z to platform Z before any workspace/IK check.
             wz_platform = wz + config.EE_OFFSET_Z_MM
             in_workspace = self.check_workspace(wx, wy, wz_platform)
-            # In conveyor mode, also allow objects in the approach zone (y > Y_LIMIT)
-            # so the robot can pre-position while the object is still incoming.
+            # In conveyor mode, also allow objects in the approach zone (x > X_LIMIT,
+            # the amber overlay) so the robot can pre-position while the object is
+            # still incoming.  Conveyor moves objects in the -X direction of robot
+            # base (see draw_conveyor_zones), so X is the axis that gates entry —
+            # not Y.
             in_approach_zone = (
                 config.CONVEYOR_MODE
-                and abs(wx) <= config.X_LIMIT
-                and wy > config.Y_LIMIT
+                and abs(wy) <= config.Y_LIMIT
+                and wx > config.X_LIMIT
                 and config.Z_MIN <= wz_platform <= config.Z_MAX
                 and len(self._timed_xyz_bufs.get(track_id, [])) >= 3
             )
@@ -375,6 +401,18 @@ class DeltaCamera(Node):
                         # Also allow early trigger from approach zone.
                         allowed = True
                         reason = "CONVEYOR_OK" if in_workspace else "APPROACH_ZONE"
+                        if in_workspace:
+                            # Publish THIS detection's own position, not just the
+                            # frame's "best" — the workspace-entry gate needs to
+                            # confirm the robot's actual target entered the zone,
+                            # not that some other object on the belt did.
+                            we_pt = PointStamped()
+                            we_pt.header.stamp = self.get_clock().now().to_msg()
+                            we_pt.header.frame_id = "robot_base"
+                            we_pt.point.x = x_use / 1000.0
+                            we_pt.point.y = y_use / 1000.0
+                            we_pt.point.z = z_use / 1000.0
+                            self._pub_workspace_entry.publish(we_pt)
                     elif not self.is_stable(xyz_avg):
                         reason = "NOT_STABLE"
                         self.get_logger().warn(
@@ -508,25 +546,25 @@ class DeltaCamera(Node):
                     pt = PointStamped()
                     pt.header.stamp = stamp
                     pt.header.frame_id = "robot_base"
-                    pt.point.x = best["x_base"] / 1000.0
+                    pt.point.y = best["y_base"] / 1000.0
                     pt.point.z = best["z_base"] / 1000.0
                     best_timed_buf = self._timed_xyz_bufs.get(best["track_id"], deque())
                     if config.CONVEYOR_MODE and len(best_timed_buf) > 0:
-                        # Use the most recent raw Y to avoid the ~(AVG_FRAME_COUNT/2)-frame
-                        # median lag. The robot's prediction adds vy*t_travel on top of this.
-                        pt.point.y = best_timed_buf[-1][2] / 1000.0
+                        # Use the most recent raw X to avoid the ~(AVG_FRAME_COUNT/2)-frame
+                        # median lag. The robot's prediction adds vx*t_travel on top of this.
+                        pt.point.x = best_timed_buf[-1][1] / 1000.0
                     else:
-                        pt.point.y = best["y_base"] / 1000.0
+                        pt.point.x = best["x_base"] / 1000.0
                     self._pub_target.publish(pt)
 
                     vel = PointStamped()
                     vel.header.stamp = stamp
                     vel.header.frame_id = "robot_base"
-                    vel.point.y = self._estimate_vy(best_timed_buf)
+                    vel.point.x = self._estimate_vx(best_timed_buf)
                     self._pub_velocity.publish(vel)
 
-        # Sort by Y ascending: lowest Y = most advanced on conveyor = pick first (#1)
-        all_candidates.sort(key=lambda c: c["y_base"])
+        # Sort by X ascending: lowest X = most advanced on conveyor = pick first (#1)
+        all_candidates.sort(key=lambda c: c["x_base"])
 
         # Draw pick-order numbered badges on every detected object
         for pick_num, c in enumerate(all_candidates, start=1):
@@ -613,6 +651,48 @@ class DeltaCamera(Node):
                     f"EE vs obj: dx={dx_smooth:+.1f} dy={dy_smooth:+.1f} mm"
                 )
 
+            # True laser-vs-object error: deproject the actual laser dot pixel
+            # (not FK) using the object's own depth as Z, since the laser lands
+            # on/near the object surface.  Only meaningful when the laser is
+            # actually visible — unlike EE-vs-obj above, this needs no FK.
+            if ee_pixel is not None:
+                lu, lv = ee_pixel
+                laser_cam = self.pixel_to_camera_xyz_mm(lu, lv, error_det["z_cam"] / 1000.0)
+                if laser_cam is not None:
+                    laser_x_base, laser_y_base, _ = self.camera_to_base_mm(*laser_cam)
+                    if not hasattr(self, '_laser_err_buf'):
+                        # Short window (was 10): after every move the raw error
+                        # jumps enough to clear this buffer (see reset check
+                        # below), and WAITING_ALIGN in matlab_bridge_node.py
+                        # blocks on it converging — a 10-frame refill was the
+                        # dominant source of post-move grip delay.
+                        self._laser_err_buf = deque(maxlen=3)
+                    laser_dx_mm = -(error_det["x_base"] - laser_x_base)
+                    laser_dy_mm = error_det["y_base"] - laser_y_base
+                    if self._laser_err_buf:
+                        last_ldx = sum(e[0] for e in self._laser_err_buf) / len(self._laser_err_buf)
+                        last_ldy = sum(e[1] for e in self._laser_err_buf) / len(self._laser_err_buf)
+                        if (laser_dx_mm - last_ldx)**2 + (laser_dy_mm - last_ldy)**2 > 900:
+                            self._laser_err_buf.clear()
+                    self._laser_err_buf.append((laser_dx_mm, laser_dy_mm))
+                    laser_dx_smooth = sum(e[0] for e in self._laser_err_buf) / len(self._laser_err_buf)
+                    laser_dy_smooth = sum(e[1] for e in self._laser_err_buf) / len(self._laser_err_buf)
+
+                    # Tolerance radius for "laser reached the object": half the
+                    # object's own short-side width, so it scales with object
+                    # size instead of a fixed mm guess.  Carried in point.z
+                    # (not a Z coordinate) so one message has everything the
+                    # FSM's alignment check needs.
+                    align_tol_mm = 0.5 * error_det["obj_size_mm"][1]
+
+                    laser_err_pt = PointStamped()
+                    laser_err_pt.header.stamp = self.get_clock().now().to_msg()
+                    laser_err_pt.header.frame_id = "robot_base"
+                    laser_err_pt.point.x = laser_dx_smooth
+                    laser_err_pt.point.y = laser_dy_smooth
+                    laser_err_pt.point.z = align_tol_mm
+                    self._pub_laser_error.publish(laser_err_pt)
+
         if best is not None:
             pad = 10
             self._last_obj_bbox = (
@@ -645,7 +725,13 @@ class DeltaCamera(Node):
 
     def draw_workspace_overlay(self, annotated, frame_w: int, frame_h: int):
         if config.DRAW_WORKSPACE_ZONES:
-            self.draw_conveyor_zones(annotated, frame_w, frame_h)
+            # Only overwrite the cached polygon on a successful projection —
+            # matches the original inline implementation, which left the
+            # previous frame's _ws_poly in place on a transient projection
+            # failure instead of clearing the EE-marker search-bounds filter.
+            ws_poly = self.draw_conveyor_zones(annotated, frame_w, frame_h)
+            if ws_poly is not None:
+                self._ws_poly = ws_poly
 
         if config.WORKSPACE_ROI_ENABLE:
             x1, y1, x2, y2 = self.get_workspace_roi(frame_w, frame_h)
@@ -661,82 +747,15 @@ class DeltaCamera(Node):
             cv2.addWeighted(overlay, 0.18, annotated, 0.82, 0.0, annotated)
 
     def draw_conveyor_zones(self, annotated, frame_w: int, frame_h: int):
-        """Overlay three zones projected from robot base frame onto the camera image.
-
-        Zone layout (conveyor moves objects in the -Y direction of robot base):
-          APPROACH (amber) — object visible but not yet in robot reach (y > +Y_LIMIT)
-          WORKSPACE (green) — robot can pick here (|x|,|y| within ±X_LIMIT/Y_LIMIT)
-          EXIT (red) — object has passed workspace (y < -Y_LIMIT)
-
-        The workspace square is projected to pixels using T_base_to_cam + pinhole
-        projection, so it automatically accounts for camera position and orientation.
-        """
+        """Overlay three zones projected from robot base frame onto the camera
+        image — delegates to the shared delta_common.workspace_overlay
+        implementation. Returns the workspace polygon or None (see that
+        module's docstring for the zone layout)."""
         if self.fx is None:
-            return
-
-        L = config.X_LIMIT          # 151.563 mm — half-width of workspace square
-        z = config.WORKSPACE_PICK_Z_MM  # belt surface in base frame
-        ox = getattr(config, "WORKSPACE_OVERLAY_X_OFFSET_MM", 0.0)
-        oy = getattr(config, "WORKSPACE_OVERLAY_Y_OFFSET_MM", 0.0)
-
-        # Project 4 corners of the reachable square at pick Z.
-        # Split into entry edge (y=+L, where belt objects arrive) and
-        # exit edge (y=-L, where objects leave robot reach).
-        entry_px, exit_px = [], []
-        for sx in (-1.0, 1.0):
-            for sy, bucket in ((+1.0, entry_px), (-1.0, exit_px)):
-                pt = self._project_base_to_pixel(sx * L + ox, sy * L + oy, z)
-                if pt is None:
-                    return   # camera not ready or point behind camera
-                bucket.append(pt)
-
-        # Sort each edge by pixel u so polygon vertices wind consistently
-        entry_px.sort(key=lambda p: p[0])
-        exit_px.sort(key=lambda p: p[0])
-        el, er = entry_px   # left & right pixel of entry edge (high v, near bottom)
-        xl, xr = exit_px    # left & right pixel of exit edge  (low v,  near top)
-
-        # Skip drawing if the projection is wildly outside the frame
-        all_v = [el[1], er[1], xl[1], xr[1]]
-        if min(all_v) > 2 * frame_h or max(all_v) < -frame_h:
-            return
-
-        overlay = annotated.copy()
-
-        # ── fill zones ────────────────────────────────────────────────────────
-        # Approach: entry edge → bottom of image
-        ap_poly = np.array([[0, frame_h], [frame_w, frame_h],
-                             list(er), list(el)], dtype=np.int32)
-        cv2.fillPoly(overlay, [ap_poly], (0, 160, 255))          # amber
-
-        # Robot workspace: the 4 projected corners
-        ws_poly = np.array([list(el), list(er), list(xr), list(xl)], dtype=np.int32)
-        self._ws_poly = ws_poly   # cached for EE bounds filter
-        cv2.fillPoly(overlay, [ws_poly], (0, 200, 60))           # green
-
-        # Exit: top of image → exit edge
-        ex_poly = np.array([[0, 0], [frame_w, 0],
-                             list(xr), list(xl)], dtype=np.int32)
-        cv2.fillPoly(overlay, [ex_poly], (60, 60, 200))          # red
-
-        cv2.addWeighted(overlay, 0.20, annotated, 0.80, 0.0, annotated)
-
-        # ── border lines ──────────────────────────────────────────────────────
-        cv2.polylines(annotated, [ws_poly], True, (0, 255, 60), 2)
-        cv2.line(annotated, tuple(el), tuple(er), (0, 160, 255), 2)  # entry
-        cv2.line(annotated, tuple(xl), tuple(xr), (60, 60, 200), 2)  # exit
-
-        # ── workspace center crosshair (X=0, Y=0) ────────────────────────────
-        ctr = self._project_base_to_pixel(
-            getattr(config, 'WORKSPACE_OVERLAY_X_OFFSET_MM', 0.0),
-            getattr(config, 'WORKSPACE_OVERLAY_Y_OFFSET_MM', 0.0),
-            z,
+            return None
+        return workspace_overlay.draw_conveyor_zones(
+            annotated, frame_w, frame_h, self._project_base_to_pixel
         )
-        if ctr is not None:
-            cx, cy = int(ctr[0]), int(ctr[1])
-            cv2.line(annotated, (cx - 4, cy), (cx + 4, cy), (255, 255, 255), 1)
-            cv2.line(annotated, (cx, cy - 4), (cx, cy + 4), (255, 255, 255), 1)
-
 
     def draw_base_axis_overlay(self, annotated, x1: int, y1: int, x2: int, y2: int):
         roi_w = max(1, x2 - x1)
@@ -2203,11 +2222,7 @@ class DeltaCamera(Node):
     def pixel_to_camera_xyz_mm(self, u: int, v: int, z_m: float):
         if self.fx is None or self.fy is None or self.cx is None or self.cy is None:
             return None
-
-        z_mm = z_m * 1000.0
-        x_mm = ((u - self.cx) * z_mm) / self.fx
-        y_mm = ((v - self.cy) * z_mm) / self.fy
-        return x_mm, y_mm, z_mm
+        return camera_geometry.pixel_to_camera_xyz_mm(self.fx, self.fy, self.cx, self.cy, u, v, z_m)
 
     def estimate_object_size(self, contour, x1: int, y1: int, x2: int, y2: int, z_mm: float):
         bbox_w_px = max(0.0, float(x2 - x1))
@@ -2241,188 +2256,24 @@ class DeltaCamera(Node):
         }
 
     def detect_ee_marker(self, frame, ws_corners=None, exclude_bbox=None):
-        """Detect 650nm laser dot. Returns (u, v) centroid or None.
-
-        Uses ROI-based search: once the dot is found, only searches within
-        EE_LASER_ROI_PX pixels of the last known position. This prevents the
-        laser reflection off the object surface (20-50px away due to parallax)
-        from being mistaken for the EE tip.
-        """
-        if not hasattr(self, '_ee_history'):
-            self._ee_history = deque(maxlen=config.EE_LASER_SMOOTH_FRAMES)
-
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        fh, fw = hsv.shape[:2]
-
-        sat_min  = int(config.EE_LASER_SAT_MIN)
-        val_min  = int(config.EE_LASER_VAL_MIN)
-        max_area = int(config.EE_LASER_MAX_AREA)
-        roi_r    = int(getattr(config, 'EE_LASER_ROI_PX', 35))
-
-        mask1 = cv2.inRange(hsv,
-            (config.EE_LASER_HUE_LOW1, sat_min, val_min),
-            (config.EE_LASER_HUE_HIGH1, 255, 255))
-        mask2 = cv2.inRange(hsv,
-            (config.EE_LASER_HUE_LOW2, sat_min, val_min),
-            (config.EE_LASER_HUE_HIGH2, 255, 255))
-        mask_red  = cv2.bitwise_or(mask1, mask2)
-        mask_core = cv2.inRange(hsv,
-            (0, 0, int(config.EE_LASER_CORE_VAL_MIN)),
-            (180, int(config.EE_LASER_CORE_SAT_MAX), 255))
-
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask_red  = cv2.morphologyEx(mask_red,  cv2.MORPH_CLOSE, k)
-        mask_core = cv2.morphologyEx(mask_core, cv2.MORPH_CLOSE, k)
-
-        last_pos = self._ee_history[-1] if self._ee_history else None
-        if last_pos is not None:
-            lx, ly = last_pos
-            roi_mask = np.zeros((fh, fw), dtype=np.uint8)
-            x1r = max(0, lx - roi_r); x2r = min(fw, lx + roi_r)
-            y1r = max(0, ly - roi_r); y2r = min(fh, ly + roi_r)
-            roi_mask[y1r:y2r, x1r:x2r] = 255
-            search_red  = cv2.bitwise_and(mask_red,  roi_mask)
-            search_core = cv2.bitwise_and(mask_core, roi_mask)
-        else:
-            search_red  = mask_red
-            search_core = mask_core
-
-        ws_xs = ws_ys = None
-        if ws_corners is not None:
-            ws_xs = [p[0] for p in ws_corners]
-            ws_ys = [p[1] for p in ws_corners]
-
-        v_chan   = hsv[:, :, 2]
-        tmp_mask = np.zeros((fh, fw), dtype=np.uint8)
-
-        def _pick(mask):
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            best_c, best_score = None, -1.0
-            for c in contours:
-                area = float(cv2.contourArea(c))
-                if not (config.EE_LASER_MIN_AREA <= area <= max_area):
-                    continue
-
-                # Shape classification: laser dot is circular and compact
-                perimeter = cv2.arcLength(c, True)
-                if perimeter < 1.0:
-                    continue
-                circularity = (4.0 * math.pi * area) / (perimeter * perimeter)
-                if circularity < 0.35:   # elongated or irregular — not a laser dot
-                    continue
-                (_, _), (bw, bh), _ = cv2.minAreaRect(c)
-                if bw > 0 and bh > 0:
-                    aspect = max(bw, bh) / min(bw, bh)
-                    if aspect > 2.5:     # too elongated — reflection artifact
-                        continue
-
-                M_c = cv2.moments(c)
-                if M_c["m00"] == 0:
-                    continue
-                cx = int(M_c["m10"] / M_c["m00"])
-                cy = int(M_c["m01"] / M_c["m00"])
-                if ws_xs is not None:
-                    if not (min(ws_xs) <= cx <= max(ws_xs) and
-                            min(ws_ys) <= cy <= max(ws_ys)):
-                        continue
-
-                tmp_mask[:] = 0
-                cv2.drawContours(tmp_mask, [c], -1, 255, cv2.FILLED)
-                mean_v = float(cv2.mean(v_chan, mask=tmp_mask)[0])
-
-                # Score = brightness × circularity — rewards compact bright dots
-                score = mean_v * circularity
-                if score > best_score:
-                    best_score = score
-                    best_c = c
-            return best_c
-
-        best = _pick(search_red)
-        if best is None:
-            best = _pick(search_core)
-        if best is None and last_pos is not None:
-            best = _pick(mask_red)
-        if best is None and last_pos is not None:
-            best = _pick(mask_core)
-
-        raw = None
-        if best is not None:
-            M = cv2.moments(best)
-            if M["m00"] != 0:
-                raw = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
-
-        if not hasattr(self, '_ee_history'):
-            self._ee_history = deque(maxlen=config.EE_LASER_SMOOTH_FRAMES)
-
-        result = None
-        if raw is not None:
-            if self._ee_history:
-                lx, ly = self._ee_history[-1]
-                jump = ((raw[0] - lx) ** 2 + (raw[1] - ly) ** 2) ** 0.5
-                if jump > config.EE_LASER_MAX_JUMP_PX:
-                    raw = None
-
-        if raw is not None:
-            self._ee_history.append(raw)
-
-        if self._ee_history:
-            xs = sorted(p[0] for p in self._ee_history)
-            ys = sorted(p[1] for p in self._ee_history)
-            n  = len(xs)
-            result = (xs[n // 2], ys[n // 2])
-
-        return result
+        """Detect 650nm laser dot — delegates to the shared
+        delta_common.ee_marker.EEMarkerDetector. Returns (u, v) or None."""
+        return self._ee_marker.detect(frame, ws_corners=ws_corners)
 
     def _build_T_cam_to_base(self):
-        """Build the 4×4 homogeneous transform T_cam_to_base.
-
-        p_base = T_cam_to_base @ [p_cam; 1]
-
-        Returns (T_cam_to_base, T_base_to_cam) both as (4,4) float64 arrays.
-        The inverse is computed analytically: T_inv = [[R.T, -R.T @ t], [0,0,0,1]]
-        which avoids numerical error from np.linalg.inv on a rotation matrix.
-        """
-        R = self.build_camera_rotation_matrix()
-        t = np.array([config.CAM_TX_MM, config.CAM_TY_MM, config.CAM_TZ_MM],
-                     dtype=np.float64)
-
-        T = np.eye(4, dtype=np.float64)
-        T[:3, :3] = R
-        T[:3,  3] = t
-
-        T_inv = np.eye(4, dtype=np.float64)
-        T_inv[:3, :3] = R.T
-        T_inv[:3,  3] = -R.T @ t
-
+        """Build the 4×4 homogeneous transform T_cam_to_base (delegates to the
+        shared delta_common.camera_geometry implementation so this and any
+        other detector-side node build the identical transform)."""
+        T, T_inv = camera_geometry.build_T_cam_to_base()
+        t = T[:3, 3]
         self.get_logger().info(
             f"T_cam_to_base built  t=({t[0]:.1f}, {t[1]:.1f}, {t[2]:.1f}) mm  "
-            f"det(R)={np.linalg.det(R):.6f}"
+            f"det(R)={np.linalg.det(T[:3, :3]):.6f}"
         )
         return T, T_inv
 
     def build_camera_rotation_matrix(self):
-        legacy = self.legacy_rotation_matrix(config.CAMERA_TRANSFORM_MODE)
-
-        if config.CAMERA_USE_DIRECT_MATRIX:
-            try:
-                matrix = np.array(config.CAMERA_DIRECT_MATRIX, dtype=np.float64)
-                if matrix.shape != (3, 3):
-                    raise ValueError(f"expected 3x3 matrix, got {matrix.shape}")
-            except Exception as ex:
-                self.get_logger().warning(
-                    f"Invalid CAMERA_DIRECT_MATRIX, falling back to legacy mode: {ex}"
-                )
-                matrix = legacy
-        else:
-            matrix = legacy
-
-        fine = self.rpy_rotation_matrix(
-            config.CAM_FINE_ROLL_DEG,
-            config.CAM_FINE_PITCH_DEG,
-            config.CAM_FINE_YAW_DEG,
-        )
-        matrix = fine @ matrix
-
+        matrix = camera_geometry.build_camera_rotation_matrix()
         self.get_logger().info(
             "Camera transform rotation ready: "
             f"mode={config.CAMERA_TRANSFORM_MODE}, "
@@ -2457,7 +2308,12 @@ class DeltaCamera(Node):
             errors.append(f"Y_LIMIT must be > 0, got {config.Y_LIMIT}")
         if config.DEPTH_MIN_M >= config.DEPTH_MAX_M:
             errors.append("DEPTH_MIN_M must be < DEPTH_MAX_M")
-        valid_modes = ("yolo", "white_rectangle", "blue_rectangle", "orange_square", "orange_blob", "depth_foreground", "bbox_only")
+        # "weed_seg" is handled by delta_weed_bridge's weed_bridge_node, not this
+        # node's generate_detections() dispatch — accepted here only so
+        # camera_system.py doesn't hard-crash if launched while
+        # config.DETECTION_MODE is set to it (it'll just detect nothing, since
+        # self.model is None unless DETECTION_MODE == "yolo").
+        valid_modes = ("yolo", "white_rectangle", "blue_rectangle", "orange_square", "orange_blob", "depth_foreground", "bbox_only", "weed_seg")
         if config.DETECTION_MODE.lower() not in valid_modes:
             errors.append(f"DETECTION_MODE '{config.DETECTION_MODE}' not in {valid_modes}")
         if config.CAMERA_USE_DIRECT_MATRIX:
@@ -2495,40 +2351,10 @@ class DeltaCamera(Node):
         self.get_logger().info("Config validation passed")
 
     def legacy_rotation_matrix(self, mode: str):
-        mode = mode.upper()
-        if mode == "A":
-            return np.array(
-                ((0.0, 1.0, 0.0), (-1.0, 0.0, 0.0), (0.0, 0.0, -1.0)),
-                dtype=np.float64,
-            )
-        if mode == "B":
-            return np.array(
-                ((0.0, -1.0, 0.0), (1.0, 0.0, 0.0), (0.0, 0.0, -1.0)),
-                dtype=np.float64,
-            )
-        if mode == "C":
-            return np.array(
-                ((-1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, -1.0)),
-                dtype=np.float64,
-            )
-        return np.array(
-            ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, -1.0)),
-            dtype=np.float64,
-        )
+        return camera_geometry.legacy_rotation_matrix(mode)
 
     def rpy_rotation_matrix(self, roll_deg: float, pitch_deg: float, yaw_deg: float):
-        roll = math.radians(roll_deg)
-        pitch = math.radians(pitch_deg)
-        yaw = math.radians(yaw_deg)
-
-        cx, sx = math.cos(roll), math.sin(roll)
-        cy, sy = math.cos(pitch), math.sin(pitch)
-        cz, sz = math.cos(yaw), math.sin(yaw)
-
-        rx = np.array(((1.0, 0.0, 0.0), (0.0, cx, -sx), (0.0, sx, cx)), dtype=np.float64)
-        ry = np.array(((cy, 0.0, sy), (0.0, 1.0, 0.0), (-sy, 0.0, cy)), dtype=np.float64)
-        rz = np.array(((cz, -sz, 0.0), (sz, cz, 0.0), (0.0, 0.0, 1.0)), dtype=np.float64)
-        return rz @ ry @ rx
+        return camera_geometry.rpy_rotation_matrix(roll_deg, pitch_deg, yaw_deg)
 
     def image_points_to_base_xy(self, points_uv):
         if self.plane_homography is None:
@@ -2607,25 +2433,17 @@ class DeltaCamera(Node):
         }
 
     def camera_to_base_mm(self, x_cam: float, y_cam: float, z_cam: float):
-        p_cam = np.array([x_cam, y_cam, z_cam, 1.0], dtype=np.float64)
-        p_base = self.T_cam_to_base @ p_cam
-        return float(p_base[0]), float(p_base[1]), float(p_base[2])
+        return camera_geometry.camera_to_base_mm(self.T_cam_to_base, x_cam, y_cam, z_cam)
 
     def _project_base_to_pixel(self, x_b: float, y_b: float, z_b: float):
-        """Project a base-frame point (mm) to image pixel (u, v) via T_base_to_cam
-        and pinhole projection.  Returns None if camera not calibrated or point
-        is behind the camera (z_cam <= 0).
-        """
+        """Project a base-frame point (mm) to image pixel (u, v) — delegates to
+        the shared delta_common.camera_geometry implementation. Returns None if
+        camera not calibrated or point is behind the camera (z_cam <= 0)."""
         if self.fx is None:
             return None
-        p_cam = self.T_base_to_cam @ np.array([x_b, y_b, z_b, 1.0], dtype=np.float64)
-        x_c, y_c, z_c = p_cam[:3]
-        if z_c <= 1.0:
-            return None
-        # ratio x_c/z_c is unitless (mm/mm) so fx/fy pixel values work directly
-        u = int(round(self.fx * x_c / z_c + self.cx))
-        v = int(round(self.fy * y_c / z_c + self.cy))
-        return u, v
+        return camera_geometry.project_base_to_pixel(
+            self.fx, self.fy, self.cx, self.cy, self.T_base_to_cam, x_b, y_b, z_b
+        )
 
     def camera_to_parallel_mm(self, x_cam: float, y_cam: float, z_cam: float):
         camera_xyz = np.array((x_cam, y_cam, z_cam), dtype=np.float64)
@@ -2648,35 +2466,18 @@ class DeltaCamera(Node):
         xyz_avg = np.median(arr, axis=0)
         return float(xyz_avg[0]), float(xyz_avg[1]), float(xyz_avg[2])
 
-    def _estimate_vy(self, timed_buf=None) -> float:
-        """Estimate conveyor velocity along Y axis (mm/s).
+    def _estimate_vx(self, timed_buf=None) -> float:
+        """Estimate conveyor velocity along X axis (mm/s).
 
         Uses linear regression over the timed XYZ buffer.  The result is
         sanity-checked against CONVEYOR_VY_MIN/MAX_MM_S:
-          - Fewer than 3 samples or |vy| < MIN  → belt is stopped, return 0.
-          - |vy| > MAX                           → regression outlier,
+          - Fewer than 3 samples or |vx| < MIN  → belt is stopped, return 0.
+          - |vx| > MAX                           → regression outlier,
                                                    fall back to design speed.
-        Sign is negative (belt moves in –Y direction).
+        Sign is negative (belt moves in –X direction).
         """
         buf_src = timed_buf if timed_buf is not None else deque()
-        if len(buf_src) < 3:
-            return 0.0
-
-        buf = np.array(buf_src, dtype=np.float64)
-        t   = buf[:, 0] - buf[0, 0]
-        y   = buf[:, 2]
-        A   = np.vstack([t, np.ones(len(t))]).T
-        vy, _ = np.linalg.lstsq(A, y, rcond=None)[0]
-
-        if not config.CONVEYOR_MODE:
-            return float(vy)
-
-        vy_abs = abs(vy)
-        if vy_abs < config.CONVEYOR_VY_MIN_MM_S:
-            return 0.0                              # belt stopped / very slow
-        if vy_abs > config.CONVEYOR_VY_MAX_MM_S:
-            return -config.CONVEYOR_BELT_SPEED_MM_S # outlier → use design speed
-        return float(vy)
+        return camera_geometry.estimate_conveyor_vx_mm_s(buf_src)
 
     def is_stable(self, xyz_avg) -> bool:
         if self.last_stable_xyz is None:
@@ -2700,37 +2501,7 @@ class DeltaCamera(Node):
         return fk_check_workspace(x, y, z)
 
     def validate_target(self, x_base, y_base, z_base):
-        # z_base is EE-tip Z; convert to platform Z for IK (motor_controller does the same).
-        z_platform = z_base + config.EE_OFFSET_Z_MM
-        if not self.check_workspace(x_base, y_base, z_platform):
-            return None, None, None, False, "OUTSIDE_WORKSPACE"
-
-        st_ik, t1, t2, t3 = delta_calcInverse(x_base, y_base, z_platform, e, f, re, rf)
-        if st_ik != 0:
-            return None, None, None, False, "IK_FAILED"
-
-        if not (
-            config.THETA1_MIN <= t1 <= config.THETA1_MAX
-            and config.THETA2_MIN <= t2 <= config.THETA2_MAX
-            and config.THETA3_MIN <= t3 <= config.THETA3_MAX
-        ):
-            return (t1, t2, t3), None, None, False, "JOINT_LIMIT"
-
-        st_fk, x_fk, y_fk, z_fk = delta_calcForward(t1, t2, t3, e, f, re, rf)
-        if st_fk != 0:
-            return (t1, t2, t3), None, None, False, "FK_FAILED"
-
-        fk_xyz = (x_fk, y_fk, z_fk)
-        fk_err = math.sqrt(
-            (x_base - x_fk) ** 2
-            + (y_base - y_fk) ** 2
-            + (z_platform - z_fk) ** 2
-        )
-
-        if fk_err > config.FK_VERIFY_TOL_MM:
-            return (t1, t2, t3), fk_xyz, fk_err, False, "FK_MISMATCH"
-
-        return (t1, t2, t3), fk_xyz, fk_err, True, "OK"
+        return camera_geometry.validate_target(x_base, y_base, z_base)
 
     def maybe_print_result(self, best):
         now = time.time()
@@ -2925,14 +2696,19 @@ class DeltaCamera(Node):
     def run_cam_offset_calibration(self) -> None:
         """
         Start camera offset calibration.
-        Place an object at the physical robot centre (X=0, Y=0) before calling.
-        After 30 detected frames the node prints the required CAM_TX_MM / CAM_TY_MM
-        corrections. The robot is not moved.
+        Move the EE (laser/marker) to the physical robot centre (X=0, Y=0)
+        AND down to belt/ground height (config.FAKE_DEPTH_M) before calling —
+        the laser-pixel back-projection assumes the marker sits at that
+        depth. After 30 detected frames the node prints the required
+        CAM_TX_MM / CAM_TY_MM corrections. The robot is not moved by this
+        call itself.
         """
         self._cal_samples = []
         self._cal_active = True
         self.get_logger().info(
-            "Cam offset calibration started — place object at robot centre (X=0, Y=0). "
+            "Cam offset calibration started — EE laser must be at robot centre "
+            "(X=0, Y=0) AND at belt height "
+            f"({config.FAKE_DEPTH_M * 1000:.0f}mm from camera). "
             "Collecting 30 detections..."
         )
 

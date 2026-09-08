@@ -5,8 +5,6 @@
 #include <builtin_interfaces/msg/time.hpp>
 #include <custom_messages/msg/delta_joint_angles.hpp>
 #include <custom_messages/msg/delta_target.hpp>
-#include <geometry_msgs/msg/point.hpp>
-#include <geometry_msgs/msg/point_stamped.hpp>
 #include <std_msgs/msg/header.hpp>
 #include "sim4_ROS2_delta_types.h"
 #include "slros_msgconvert_utils.h"
@@ -20,12 +18,6 @@
 
 [[maybe_unused]] static void convertFromBus(custom_messages::msg::DeltaTarget& msgPtr, SL_Bus_custom_messages_DeltaTarget const* busPtr);
 [[maybe_unused]] static void convertToBus(SL_Bus_custom_messages_DeltaTarget* busPtr, const custom_messages::msg::DeltaTarget& msgPtr);
-
-[[maybe_unused]] static void convertFromBus(geometry_msgs::msg::Point& msgPtr, SL_Bus_geometry_msgs_Point const* busPtr);
-[[maybe_unused]] static void convertToBus(SL_Bus_geometry_msgs_Point* busPtr, const geometry_msgs::msg::Point& msgPtr);
-
-[[maybe_unused]] static void convertFromBus(geometry_msgs::msg::PointStamped& msgPtr, SL_Bus_geometry_msgs_PointStamped const* busPtr);
-[[maybe_unused]] static void convertToBus(SL_Bus_geometry_msgs_PointStamped* busPtr, const geometry_msgs::msg::PointStamped& msgPtr);
 
 [[maybe_unused]] static void convertFromBus(std_msgs::msg::Header& msgPtr, SL_Bus_std_msgs_Header const* busPtr);
 [[maybe_unused]] static void convertToBus(SL_Bus_std_msgs_Header* busPtr, const std_msgs::msg::Header& msgPtr);
@@ -102,46 +94,6 @@
   busPtr->x_mm =  msgPtr.x_mm;
   busPtr->y_mm =  msgPtr.y_mm;
   busPtr->z_mm =  msgPtr.z_mm;
-}
-
-
-// Conversions between SL_Bus_geometry_msgs_Point and geometry_msgs::msg::Point
-
-[[maybe_unused]] static void convertFromBus(geometry_msgs::msg::Point& msgPtr, SL_Bus_geometry_msgs_Point const* busPtr)
-{
-  const std::string rosMessageType("geometry_msgs/Point");
-
-  msgPtr.x =  busPtr->x;
-  msgPtr.y =  busPtr->y;
-  msgPtr.z =  busPtr->z;
-}
-
-[[maybe_unused]] static void convertToBus(SL_Bus_geometry_msgs_Point* busPtr, const geometry_msgs::msg::Point& msgPtr)
-{
-  const std::string rosMessageType("geometry_msgs/Point");
-
-  busPtr->x =  msgPtr.x;
-  busPtr->y =  msgPtr.y;
-  busPtr->z =  msgPtr.z;
-}
-
-
-// Conversions between SL_Bus_geometry_msgs_PointStamped and geometry_msgs::msg::PointStamped
-
-[[maybe_unused]] static void convertFromBus(geometry_msgs::msg::PointStamped& msgPtr, SL_Bus_geometry_msgs_PointStamped const* busPtr)
-{
-  const std::string rosMessageType("geometry_msgs/PointStamped");
-
-  convertFromBus(msgPtr.header, &busPtr->header);
-  convertFromBus(msgPtr.point, &busPtr->point);
-}
-
-[[maybe_unused]] static void convertToBus(SL_Bus_geometry_msgs_PointStamped* busPtr, const geometry_msgs::msg::PointStamped& msgPtr)
-{
-  const std::string rosMessageType("geometry_msgs/PointStamped");
-
-  convertToBus(&busPtr->header, msgPtr.header);
-  convertToBus(&busPtr->point, msgPtr.point);
 }
 
 

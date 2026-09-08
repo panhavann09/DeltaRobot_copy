@@ -4,9 +4,9 @@
 //
 // Code generated for Simulink model 'sim4_ROS2_delta'.
 //
-// Model version                  : 1.230
+// Model version                  : 1.367
 // Simulink Coder version         : 25.2 (R2025b) 28-Jul-2025
-// C/C++ source code generated on : Thu Jul 02 13:41:51 2026
+// C/C++ source code generated on : Sat Aug 22 08:21:06 2026
 //
 #include "ros2nodeinterface.h"
 rclcpp::Node::SharedPtr SLROSNodePtr;

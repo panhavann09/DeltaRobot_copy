@@ -8,7 +8,6 @@
   <license>BSD</license>
   <buildtool_depend>ament_cmake_ros</buildtool_depend>
   <depend>custom_messages</depend>
-  <depend>geometry_msgs</depend>
   <depend>rclcpp</depend>
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
@@ -16,4 +15,4 @@
     <build_type>ament_cmake</build_type>
   </export>
 </package>
-<!-- Generated on Thu Jul 02 13:42:11 2026 -->
+<!-- Generated on Sat Aug 22 08:21:16 2026 -->

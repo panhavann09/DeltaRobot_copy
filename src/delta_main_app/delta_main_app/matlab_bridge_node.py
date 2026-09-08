@@ -5,7 +5,9 @@ matlab_bridge_node.py — Delta robot MATLAB IK bridge with built-in FSM.
 Receives a confirmed target XYZ from the camera pipeline, packages it into
 a DeltaTarget custom message, and sends it to MATLAB for IK solving.
 MATLAB publishes the joint angles back as DeltaJointAngles.  The node
-validates and executes the move, then returns home.
+executes the move, grips, then drives straight home (no lift, no place
+stop) and releases there — either chaining straight into the next queued
+pick or landing in IDLE.
 
 ━━━━ ROS2 ↔ MATLAB topic map ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   Camera → Bridge  (subscribe):
@@ -43,8 +45,8 @@ validates and executes the move, then returns home.
   end
 
 ━━━━ State machine ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  IDLE → WAITING_MATLAB → APPROACHING → MOVING → RESETTING → IDLE
-                        ↘ ERROR  ──────────────────────────────────↗
+  IDLE → WAITING_MATLAB → MOVING(+grip) → HOMING(+release) ─┬─→ WAITING_MATLAB (next pick, chained)
+                        ↘ ERROR ────────────────────────────┴─→ IDLE (no next pick queued)
 """
 
 import collections
@@ -55,45 +57,59 @@ import time
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSPresetProfiles
+from rclpy.qos import QoSDurabilityPolicy, QoSPresetProfiles, QoSProfile
 from geometry_msgs.msg import PointStamped
-from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import String
+from sensor_msgs.msg import CameraInfo, Image, JointState
+from std_msgs.msg import Float32, String
 
 from custom_messages.msg import DeltaTarget, DeltaJointAngles
 from delta_common import config
-from delta_common.fk_ik import delta_calcForward, e, f, re, rf
+from delta_common.fk_ik import JOINT_NAMES, DeltaGeometry, joint_state, solve_fk_mm, solve_ik_mm
+from delta_main_app.belt_predictor import BeltPredictor
 from delta_motor_controller.motor_controller import DeltaMotorController
+from delta_motor_controller.pneumatic_gripper import PneumaticGripper
 
 MATLAB_TIMEOUT_S     = 3.0    # seconds to wait for MATLAB joint-angle reply
-APPROACH_Z_OFFSET_MM = 40.0   # mm above EE-tip pick Z to hover before descending
-APPROACH_SETTLE_SEC  = 0.05   # settle time at approach height before pick
-Z_DROP_EXTRA_MM      = -15.0  # extra descent commanded to MATLAB, pick and place (deeper = more negative)
+# False: skip the MATLAB round-trip entirely — compute joint angles locally via
+# delta_common.fk_ik.solve_ik_mm right after committing the target, instead of
+# publishing to /delta/matlab/target_xyz and waiting on /delta/matlab/joint_thetas.
+# For testing when MATLAB/sim4_ROS2_delta isn't available. The DeltaTarget is
+# still published either way (for visibility); this only decides where the
+# joint angles that actually drive the motors come from.
+USE_MATLAB = True
+# Was -15.0 (forced extra descent below detected surface). Removed 2026-07-09 —
+# with the Z-guard/floor check gone, that overrun went uncaught and picks were
+# landing too deep. Target Z now matches the detected surface exactly.
+Z_DROP_EXTRA_MM      = -25.0    # extra descent commanded to MATLAB on pick (deeper = more negative)
 
-# ── Terrain-robust Z estimation ───────────────────────────────────────────────
-# Vegetation causes IR depth holes directly over plants.  We sample an annular
-# ring around the centroid (skipping the plant centre) to hit soil/root level,
-# then bias toward the deeper (farther-from-camera) returns which represent the
-# ground surface rather than raised leaf/stem tips.
-Z_ANNULUS_INNER_R_PX  = 8     # exclude this radius around centroid (plant top / hole)
-Z_ANNULUS_OUTER_R_PX  = 40    # outer radius of soil-sample ring (px)
-Z_SOIL_PERCENTILE     = 50.0  # median of surface returns (robust to grass tips AND background)
-Z_BG_REJECT_MM        = 50.0  # reject ring returns > this depth below the ring minimum
-Z_MIN_VALID_PX        = 5     # need at least this many valid depth pixels
-# Temporal: keep a per-target rolling Z buffer to suppress frame-to-frame noise.
-# Buffer resets when the target XY jumps >50 mm (different plant).
-Z_HISTORY_MAXLEN      = 6
-Z_HISTORY_RESET_MM    = 50.0  # XY distance that triggers a buffer reset (mm)
 # Safety: maximum depth MATLAB's IK result may command beyond the detected target Z.
 # If the FK of MATLAB's thetas puts the EE-tip more than this below the detected
 # surface, the move is rejected before any motors move.
 # Includes headroom for the intentional Z_DROP_EXTRA_MM offset above, plus the
 # original 20mm anomaly margin for MATLAB's own correction.
-MATLAB_Z_GUARD_MM     = 20.0 + abs(Z_DROP_EXTRA_MM)
+MATLAB_Z_GUARD_MM    = 20.0 + abs(Z_DROP_EXTRA_MM)
 # Hard absolute floor for EE-tip Z (mm, robot base frame, negative = below base).
 # Crash confirmed at EE-tip < -640 mm.  Set 5 mm above that as the kill limit.
 # Checked on BOTH the incoming detected target AND the MATLAB-commanded position.
-EETIP_Z_FLOOR_MM      = -638.0
+EETIP_Z_FLOOR_MM     = -638.0
+
+# ── Rigid-object Z estimation ─────────────────────────────────────────────────
+# Pick targets here are rigid delta-robot objects (blocks/cubes on a belt), not
+# vegetation: the object's own top surface facing the camera IS the reliable
+# reading, unlike a plant top which is noisy/holed. So sample a small disk
+# centred ON the object (not a ring around it) and take the median of its own
+# returns. RIGID_Z_SAMPLE_R_PX must stay smaller than the smallest object's
+# on-screen half-extent — a radius reaching past the object's edge starts
+# pulling in the surrounding belt, which is deeper than the object's real top
+# and commands the gripper straight through the object on descent.
+RIGID_Z_SAMPLE_R_PX  = 8     # disk radius around centroid (px) — stay inside the object
+RIGID_Z_PERCENTILE   = 50.0  # median of the object's own surface returns
+Z_BG_REJECT_MM        = 50.0  # reject disk returns > this depth below the disk minimum
+Z_MIN_VALID_PX        = 5     # need at least this many valid depth pixels
+# Temporal: keep a per-target rolling Z buffer to suppress frame-to-frame noise.
+# Buffer resets when the target XY jumps >50 mm (different plant).
+Z_HISTORY_MAXLEN      = 6
+Z_HISTORY_RESET_MM    = 50.0  # XY distance that triggers a buffer reset (mm)
 
 
 # ── State machine ──────────────────────────────────────────────────────────────
@@ -104,29 +120,43 @@ class MatlabBridgeFSM:
 
     States
     ------
-    IDLE            : waiting for a target
+    IDLE            : home pose (theta=0,0,0), gripper open, waiting for a target
     WAITING_MATLAB  : DeltaTarget published; waiting for DeltaJointAngles back
-    APPROACHING     : moving to hover height above pick Z using local IK (bg thread)
-    MOVING          : executing the MATLAB theta solution on the motors (bg thread)
-    RESETTING       : returning to home position after a move (bg thread)
-    ERROR           : IK invalid or MATLAB timeout; recovering to IDLE (bg thread)
+    MOVING          : executing the MATLAB theta solution on the motors; grips
+                      once settled (bg thread)
+    HOMING          : no lift, no place stop — drives straight to theta=0,0,0
+                      with the object gripped, releases once settled, then
+                      either chains straight into the next queued target
+                      (WAITING_MATLAB, no trip through IDLE) or lands IDLE
+                      (bg thread)
+    ERROR           : any failure (MATLAB timeout/ik_valid=False, unreachable
+                      thetas, or a move that never settled) — forces the
+                      gripper open, returns home, recovers to IDLE
     """
 
     def __init__(self, controller: DeltaMotorController, publish_state_fn, publish_fk_fn,
-                 publish_motor_thetas_fn, logger):
-        self._ctrl            = controller
-        self._pub_state       = publish_state_fn         # fn(state: str)
-        self._pub_fk          = publish_fk_fn             # fn(x, y, z)
-        self._pub_motor_thetas = publish_motor_thetas_fn   # fn(fb_deg, ok)
-        self._log             = logger
+                 publish_motor_thetas_fn, publish_target_fn, logger,
+                 gripper=None, publish_gripper_fn=None):
+        self._ctrl              = controller
+        self._pub_state         = publish_state_fn         # fn(state: str)
+        self._pub_fk             = publish_fk_fn             # fn(x, y, z)
+        self._pub_motor_thetas   = publish_motor_thetas_fn   # fn(fb_deg, ok)
+        self._pub_target         = publish_target_fn         # fn(x_m, y_m, z_m) -> None, sends DeltaTarget to MATLAB
+        self._gripper            = gripper                   # PneumaticGripper | None
+        self._pub_gripper        = publish_gripper_fn        # fn(pos: float) -> None, pos: 1.0=grip 0.0=release
+        self._log                = logger
 
         self._state  = "IDLE"
         self._busy   = False
         self._lock   = threading.Lock()
 
-        self._target_xyz    = None   # (x, y, z) mm
-        self._matlab_thetas = None   # (t1, t2, t3) deg
-        self._wait_start    = 0.0
+        self._target_xyz      = None   # (x, y, z) metres — target currently being worked
+        self._target_detect_t = None   # time.time() when this target was received
+        self._matlab_thetas   = None   # (t1, t2, t3) deg
+        self._wait_start      = 0.0
+        self._pending_target  = None   # (x, y, z, detect_time) received while busy — PLACING
+                                        # picks this up so the next pick chains immediately,
+                                        # with no return-home in between.
 
     # ── public API ─────────────────────────────────────────────────────────────
 
@@ -134,31 +164,64 @@ class MatlabBridgeFSM:
     def state(self) -> str:
         return self._state
 
-    def on_target(self, x: float, y: float, z: float) -> bool:
-        """Accept a new target.  Returns False if the robot is busy."""
+    @property
+    def target_xyz(self):
+        """(x, y, z) metres of the target currently committed to, or None."""
+        with self._lock:
+            return self._target_xyz
+
+    def on_target(self, x: float, y: float, z: float, detect_time=None) -> bool:
+        """Accept a new target. If busy, it's buffered as the next pick (NOT
+        dropped) and picked up automatically once the current pick+place
+        cycle finishes. Returns True only if this target was started
+        immediately."""
         with self._lock:
             if self._busy:
+                self._pending_target = (
+                    x, y, z, detect_time if detect_time is not None else time.time()
+                )
                 return False
-            self._target_xyz    = (x, y, z)
-            self._matlab_thetas = None
-            self._busy          = True
-            self._wait_start    = time.time()
-            self._set_state("WAITING_MATLAB")
-            return True
+            self._commit_target(x, y, z, detect_time)
+        self._pub_target(x, y, z)
+        if not USE_MATLAB:
+            self._solve_locally_and_proceed(x, y, z)
+        return True
 
-    def update_target(self, x: float, y: float, z: float) -> bool:
+    def _solve_locally_and_proceed(self, x: float, y: float, z: float) -> None:
+        """USE_MATLAB=False path: compute joint angles via delta_common's own
+        solve_ik_mm instead of waiting on MATLAB, then feed them through the
+        exact same on_matlab_reply() logic MATLAB's real reply would use."""
+        x_mm = x * 1000.0
+        y_mm = y * 1000.0
+        z_platform_mm = z * 1000.0 + config.EE_OFFSET_Z_MM + Z_DROP_EXTRA_MM
+        ok_ik, t1, t2, t3 = solve_ik_mm(x_mm, y_mm, z_platform_mm)
+        self.on_matlab_reply(t1, t2, t3, ok_ik)
+
+    def _commit_target(self, x: float, y: float, z: float, detect_time=None) -> None:
+        """Must be called with self._lock held. Commits (x,y,z) as the active
+        target and starts a fresh WAITING_MATLAB cycle for it. Caller is
+        responsible for publishing it to MATLAB (outside the lock)."""
+        self._target_xyz      = (x, y, z)
+        self._target_detect_t = detect_time if detect_time is not None else time.time()
+        self._matlab_thetas   = None
+        self._busy            = True
+        self._wait_start      = time.time()
+        self._set_state("WAITING_MATLAB")
+
+    def update_target(self, x: float, y: float, z: float, detect_time=None) -> bool:
         """Refresh the pending target with a fresher detection while still
-        WAITING_MATLAB or APPROACHING, so Phase 2 can commit to the most
-        recent reading instead of the one captured at cycle start.
-        Returns True if the target was refreshed."""
+        WAITING_MATLAB for it, so error/timeout logging reflects the latest
+        reading. Returns True if the target was refreshed."""
         with self._lock:
-            if self._state in ("WAITING_MATLAB", "APPROACHING"):
+            if self._state == "WAITING_MATLAB":
                 self._target_xyz = (x, y, z)
+                self._target_detect_t = detect_time if detect_time is not None else time.time()
                 return True
             return False
 
     def on_matlab_reply(self, t1: float, t2: float, t3: float, ik_valid: bool) -> None:
         """Handle DeltaJointAngles from MATLAB."""
+        invalid = False
         with self._lock:
             if self._state != "WAITING_MATLAB":
                 return
@@ -168,15 +231,20 @@ class MatlabBridgeFSM:
                     f"({self._target_xyz[0]:.1f},{self._target_xyz[1]:.1f},"
                     f"{self._target_xyz[2]:.1f}) — aborting"
                 )
-                self._set_state("ERROR")
-                threading.Thread(target=self._recover, daemon=True).start()
-                return
-            self._matlab_thetas = (t1, t2, t3)
-            self._set_state("APPROACHING")
-            threading.Thread(target=self._run_move, daemon=True).start()
+                invalid = True
+            else:
+                self._matlab_thetas = (t1, t2, t3)
+                self._set_state("MOVING")
+        # _go_error() acquires self._lock itself, so it must run after the
+        # lock above is released (threading.Lock is not reentrant).
+        if invalid:
+            self._go_error()
+            return
+        threading.Thread(target=self._run_move, daemon=True).start()
 
     def tick(self) -> None:
         """Call at ~10 Hz to enforce the MATLAB response timeout."""
+        timed_out = False
         with self._lock:
             if self._state != "WAITING_MATLAB":
                 return
@@ -188,57 +256,28 @@ class MatlabBridgeFSM:
                     f"({self._target_xyz[0]:.1f},{self._target_xyz[1]:.1f},"
                     f"{self._target_xyz[2]:.1f})"
                 )
-                self._set_state("ERROR")
-                threading.Thread(target=self._recover, daemon=True).start()
+                timed_out = True
+        # _go_error() acquires self._lock itself, so it must run after the
+        # lock above is released (threading.Lock is not reentrant).
+        if timed_out:
+            self._go_error()
 
     # ── background threads ─────────────────────────────────────────────────────
 
     def _run_move(self) -> None:
+        """State MOVING: drive to MATLAB's thetas, verify settle, then grip."""
         t1, t2, t3 = self._matlab_thetas
 
-        # Phase 1: hover above pick position using local IK so the robot
-        # never dives straight to pick depth without a safe intermediate point.
-        x_m, y_m, z_m = self._target_xyz          # meters, EE-tip frame
-        x_mm  = x_m  * 1000.0
-        y_mm  = y_m  * 1000.0
-        z_approach_mm = z_m * 1000.0 + APPROACH_Z_OFFSET_MM   # EE-tip Z
-
-        # Hard clamp: approach must never breach the absolute floor.
-        if z_approach_mm < EETIP_Z_FLOOR_MM:
+        # Hard clamp: reject before any physical move if the detected target
+        # itself is already beyond the crash floor.
+        z_eetip_target_mm = self._target_xyz[2] * 1000.0
+        if z_eetip_target_mm < EETIP_Z_FLOOR_MM:
             self._log.error(
-                f"Approach EE-tip={z_approach_mm:.1f}mm < floor={EETIP_Z_FLOOR_MM}mm "
-                "— aborting before approach"
+                f"Target EE-tip={z_eetip_target_mm:.1f}mm < floor={EETIP_Z_FLOOR_MM}mm "
+                "— aborting before move"
             )
             self._go_error()
             return
-
-        self._log.info(
-            f"Approach: XY=({x_mm:.1f},{y_mm:.1f}) "
-            f"z_eetip={z_approach_mm:.1f}mm  floor={EETIP_Z_FLOOR_MM}mm"
-        )
-        # raw=False → move_xyz adds EE_OFFSET_Z_MM internally (EE-tip → platform)
-        ok_app, *_ = self._ctrl.move_xyz(x_mm, y_mm, z_approach_mm)
-        if not ok_app:
-            self._log.warn(
-                f"Approach move failed at z_eetip={z_approach_mm:.1f}mm"
-            )
-        time.sleep(APPROACH_SETTLE_SEC)
-
-        # Phase 2: descend to MATLAB-computed pick position.
-        # Re-sample the target right before committing — update_target() has
-        # been refreshing self._target_xyz with live detections throughout
-        # WAITING_MATLAB/APPROACHING, so this picks up the freshest reading
-        # instead of the one frozen at cycle start.
-        with self._lock:
-            x_resampled, y_resampled, z_resampled = self._target_xyz
-            self._set_state("MOVING")
-        if abs(z_resampled - z_m) * 1000.0 > 1.0:
-            self._log.info(
-                f"Target re-sampled before descend: "
-                f"z_eetip {z_m * 1000.0:.1f}mm → {z_resampled * 1000.0:.1f}mm "
-                f"(Δ={(z_resampled - z_m) * 1000.0:+.1f}mm)"
-            )
-        x_m, y_m, z_m = x_resampled, y_resampled, z_resampled
 
         self._log.info(
             f"Executing MATLAB thetas: θ1={t1:.2f}° θ2={t2:.2f}° θ3={t3:.2f}°"
@@ -254,38 +293,37 @@ class MatlabBridgeFSM:
             return
 
         # ── Z guard ───────────────────────────────────────────────────────────
-        # Compute FK of MATLAB's thetas BEFORE sending to motors.
-        # If the resulting EE-tip Z is more than MATLAB_Z_GUARD_MM below the
-        # detected target surface, the move is rejected — MATLAB's correction
-        # must not drive the gripper through the belt/terrain.
-        st_pre, _, _, z_pre = delta_calcForward(t1, t2, t3, e, f, re, rf)
-        if st_pre == 0:
-            z_eetip_commanded = z_pre - config.EE_OFFSET_Z_MM
-            z_eetip_target    = self._target_xyz[2] * 1000.0   # detected, mm
-            overrun = z_eetip_target - z_eetip_commanded        # positive = commanded deeper
-            self._log.info(
-                f"Z guard: EE-tip commanded={z_eetip_commanded:.1f}mm  "
-                f"target={z_eetip_target:.1f}mm  overrun={overrun:+.1f}mm  "
-                f"floor={EETIP_Z_FLOOR_MM}mm"
-            )
-            if z_eetip_commanded < EETIP_Z_FLOOR_MM:
-                self._log.error(
-                    f"Z floor TRIP: MATLAB commands EE-tip={z_eetip_commanded:.1f}mm "
-                    f"< floor={EETIP_Z_FLOOR_MM}mm — aborting"
-                )
-                self._go_error()
-                return
-            if overrun > MATLAB_Z_GUARD_MM:
-                self._log.error(
-                    f"Z guard TRIP: MATLAB commands EE-tip {overrun:.1f}mm below "
-                    f"detected surface (guard={MATLAB_Z_GUARD_MM}mm) — aborting"
-                )
-                self._go_error()
-                return
-        else:
+        # Compute FK of MATLAB's thetas BEFORE sending to motors. If the
+        # resulting EE-tip Z is below the absolute floor, or more than
+        # MATLAB_Z_GUARD_MM below the detected target surface, reject the
+        # move — MATLAB's correction must not drive the gripper through the
+        # belt/terrain.
+        ok_fk, _, _, z_platform_commanded = solve_fk_mm(t1, t2, t3)
+        if not ok_fk:
             self._log.error(
                 f"Z guard: FK of MATLAB thetas ({t1:.1f},{t2:.1f},{t3:.1f})° "
                 "returned no solution — aborting"
+            )
+            self._go_error()
+            return
+        z_eetip_commanded = z_platform_commanded - config.EE_OFFSET_Z_MM
+        overrun = z_eetip_target_mm - z_eetip_commanded   # positive = commanded deeper
+        self._log.info(
+            f"Z guard: EE-tip commanded={z_eetip_commanded:.1f}mm  "
+            f"target={z_eetip_target_mm:.1f}mm  overrun={overrun:+.1f}mm  "
+            f"floor={EETIP_Z_FLOOR_MM}mm"
+        )
+        if z_eetip_commanded < EETIP_Z_FLOOR_MM:
+            self._log.error(
+                f"Z floor TRIP: MATLAB commands EE-tip={z_eetip_commanded:.1f}mm "
+                f"< floor={EETIP_Z_FLOOR_MM}mm — aborting"
+            )
+            self._go_error()
+            return
+        if overrun > MATLAB_Z_GUARD_MM:
+            self._log.error(
+                f"Z guard TRIP: MATLAB commands EE-tip {overrun:.1f}mm below "
+                f"detected surface (guard={MATLAB_Z_GUARD_MM}mm) — aborting"
             )
             self._go_error()
             return
@@ -295,47 +333,111 @@ class MatlabBridgeFSM:
             self._pub_fk(fk_xyz[0], fk_xyz[1], fk_xyz[2])
         self._pub_motor_thetas(fb_deg, ok)
 
-        if ok:
-            self._log.info(
-                f"Move OK  FK=({fk_xyz[0]:.1f},{fk_xyz[1]:.1f},{fk_xyz[2]:.1f})"
-                f"  err={err:.2f} mm"
+        if not ok:
+            self._log.warn(
+                f"Move did NOT settle (err={err:.2f} mm, above "
+                f"{self._ctrl.POS_TOL_MM}mm tolerance) — aborting"
             )
-        else:
-            self._log.warn(f"Move settled with err={err:.2f} mm (above tolerance)")
+            self._go_error()
+            return
+
+        self._log.info(
+            f"Move OK  FK=({fk_xyz[0]:.1f},{fk_xyz[1]:.1f},{fk_xyz[2]:.1f})"
+            f"  err={err:.2f} mm"
+        )
+        if self._target_detect_t is not None:
+            latency_s = time.time() - self._target_detect_t
+            self._log.info(
+                f"Detection→arrival latency: {latency_s:.2f}s "
+                f"(predict_target's t_robot_move should match this)"
+            )
+
+        if self._gripper is not None:
+            self._log.info("Gripping")
+            self._gripper.grip()
+            if self._pub_gripper is not None:
+                self._pub_gripper(1.0)
 
         with self._lock:
-            self._set_state("RESETTING")
-        self._do_reset()
+            self._set_state("HOMING")
+        self._run_home_and_release()
 
-    def _do_reset(self) -> None:
-        ok, fk_xyz, _, fb_deg = self._ctrl.move_thetas(0.0, 0.0, 0.0)   # exact θ=0,0,0 home
-        if ok and fk_xyz is not None:
+    def _run_home_and_release(self) -> None:
+        """State HOMING: no lift, no place stop — drive straight to home
+        (theta=0,0,0) with the object gripped, release there, then chain
+        straight into the next queued target or land in IDLE."""
+        ok, fk_xyz, err, fb_deg = self._ctrl.move_thetas(0.0, 0.0, 0.0)
+        if fk_xyz is not None:
             self._pub_fk(fk_xyz[0], fk_xyz[1], fk_xyz[2])
         self._pub_motor_thetas(fb_deg, ok)
+
+        if not ok:
+            self._log.warn(
+                f"Home move did NOT settle (err={err:.2f} mm, above "
+                f"{self._ctrl.POS_TOL_MM}mm tolerance) — releasing anyway"
+            )
+        else:
+            self._log.info(
+                f"Home OK  FK=({fk_xyz[0]:.1f},{fk_xyz[1]:.1f},{fk_xyz[2]:.1f})"
+                f"  err={err:.2f} mm"
+            )
+
+        if self._gripper is not None:
+            self._log.info("Releasing")
+            self._gripper.release()
+            if self._pub_gripper is not None:
+                self._pub_gripper(0.0)
+
         with self._lock:
-            self._state         = "IDLE"
-            self._busy          = False
-            self._target_xyz    = None
-            self._matlab_thetas = None
+            pending = self._pending_target
+            self._pending_target = None
+            if pending is not None:
+                x, y, z, detect_time = pending
+                self._commit_target(x, y, z, detect_time)
+
+        if pending is not None:
+            x, y, z, _ = pending
+            self._pub_target(x, y, z)
+            if not USE_MATLAB:
+                self._solve_locally_and_proceed(x, y, z)
+            return   # already back in WAITING_MATLAB for the next target
+
+        # Already homed above — just land the state, no second home move.
+        with self._lock:
+            self._state          = "IDLE"
+            self._busy            = False
+            self._target_xyz      = None
+            self._matlab_thetas   = None
         self._pub_state("IDLE")
         self._log.info("[FSM] → IDLE")
 
     def _go_error(self) -> None:
         with self._lock:
             self._set_state("ERROR")
-        self._recover()
+        threading.Thread(target=self._recover, daemon=True).start()
 
     def _recover(self) -> None:
-        time.sleep(1.0)
+        """Force the gripper open, return home, and land in IDLE — the single
+        shared recovery path for every failure mode (MATLAB timeout/invalid,
+        unreachable thetas, or a move that never settled)."""
+        if self._gripper is not None:
+            self._log.info("ERROR recovery — forcing gripper open")
+            try:
+                self._gripper.release()
+                if self._pub_gripper is not None:
+                    self._pub_gripper(0.0)
+            except Exception as exc:
+                self._log.error(f"Gripper release during recovery failed: {exc}")
         try:
             self._ctrl.move_thetas(0.0, 0.0, 0.0)   # exact θ=0,0,0 home
         except Exception as exc:
             self._log.error(f"Home move during recovery failed: {exc}")
         with self._lock:
-            self._state         = "IDLE"
-            self._busy          = False
-            self._target_xyz    = None
-            self._matlab_thetas = None
+            self._state           = "IDLE"
+            self._busy             = False
+            self._target_xyz       = None
+            self._matlab_thetas    = None
+            self._pending_target   = None
         self._pub_state("IDLE")
         self._log.info("[FSM] → IDLE (recovered from ERROR)")
 
@@ -360,7 +462,7 @@ class MatlabBridgeNode(Node):
 
         # ── motor controller ──────────────────────────────────────────────────
         self._ctrl = DeltaMotorController(
-            can_port="can0",
+            can_port="can1",
             vel_max=config.MOTOR_VEL_MAX,
             acc_set=config.MOTOR_ACC_SET,
         )
@@ -371,13 +473,30 @@ class MatlabBridgeNode(Node):
         else:
             self.get_logger().warn("ENABLE_MOTORS=False — dry-run mode")
 
+        # ── gripper (own bus, can2 — motors are on can1, same as main_app.py) ────
+        self._gripper = PneumaticGripper(can_channel='can1', can_id=4)
+        if config.ENABLE_MOTORS:
+            self._gripper.connect()
+            self.get_logger().info("Gripper connected (direct CAN).")
+
         # ── publishers ────────────────────────────────────────────────────────
         self._pub_to_matlab = self.create_publisher(
-            DeltaTarget, "/delta/matlab/target_xyz", 10
+            DeltaTarget, "/delta/matlab/target_xyz", 100
         )
         self._pub_state = self.create_publisher(
             String, "/delta/matlab/bridge_state", 10
         )
+        # Gripper state — [0=open, 1=closed], mirrors main_app.py's topic so
+        # `ros2 topic echo /delta/gripper_cmd` works regardless of which node
+        # is running.  TRANSIENT_LOCAL (latched): a subscriber that starts
+        # after this node — e.g. `ros2 topic echo` run mid-session — still
+        # immediately gets the last known state instead of waiting for the
+        # next grip/release event.
+        self._pub_gripper_cmd = self.create_publisher(
+            Float32, "/delta/gripper_cmd",
+            QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL),
+        )
+        self._send_gripper(0.0)   # connect() above already released — reflect it immediately
         self._pub_fk = self.create_publisher(
             PointStamped, "/delta/matlab/fk_result", 10
         )
@@ -398,6 +517,10 @@ class MatlabBridgeNode(Node):
         self._pub_ee_pos_mm = self.create_publisher(
             PointStamped, "/delta/ee_position_mm", 10
         )
+        # Real motor-encoder joint state — lets robot_state_publisher/RViz
+        # animate the URDF with the real robot's live pose.
+        self._joint_geom = DeltaGeometry()
+        self._pub_joint_states = self.create_publisher(JointState, "joint_states", 10)
 
         # ── FSM ───────────────────────────────────────────────────────────────
         self._fsm = MatlabBridgeFSM(
@@ -405,10 +528,13 @@ class MatlabBridgeNode(Node):
             publish_state_fn=self._send_state,
             publish_fk_fn=self._send_fk,
             publish_motor_thetas_fn=self._send_motor_thetas,
+            publish_target_fn=self._send_target_to_matlab,
             logger=self.get_logger(),
+            gripper=self._gripper,
+            publish_gripper_fn=self._send_gripper,
         )
 
-        # ── RealSense depth ───────────────────────────────────────────────────
+        # ── depth camera (unused: no depth stream, FAKE_DEPTH_ENABLE=True) ──────
         # Camera intrinsics (filled on first CameraInfo message)
         self._fx = self._fy = self._cx = self._cy = None
 
@@ -427,12 +553,28 @@ class MatlabBridgeNode(Node):
         self._depth_lock = threading.Lock()
         self._depth_image = None   # H×W uint16, each count = 1 mm
 
+        # Disk mask geometry is fixed (only depends on the constant radius), so
+        # build it once here instead of rebuilding the rows/cols/sqrt distance
+        # grid on every _reproject_with_real_depth call.
+        _r = RIGID_Z_SAMPLE_R_PX
+        _rows = np.arange(-_r, _r + 1)[:, None]
+        _cols = np.arange(-_r, _r + 1)[None, :]
+        _dist = np.sqrt(_rows ** 2 + _cols ** 2)
+        self._disk_mask_full = _dist <= RIGID_Z_SAMPLE_R_PX
+
         # ── Terrain Z temporal smoother ───────────────────────────────────────
         # Accumulates per-target Z readings and outputs a rolling median to
         # suppress frame-to-frame depth noise over vegetation.  Resets when the
         # detected XY jumps > Z_HISTORY_RESET_MM (different plant).
         self._z_history: collections.deque = collections.deque(maxlen=Z_HISTORY_MAXLEN)
         self._z_history_xy: tuple | None = None   # (x_m, y_m) of buffered readings
+
+        # ── belt velocity / pick-point prediction ───────────────────────────────
+        # USE_MATLAB=False bypasses MATLAB's Simulink predict_target block, which
+        # otherwise would have compensated for belt motion during travel time.
+        # BeltPredictor (same logic main_app.py uses) replaces it here.
+        self._predictor = BeltPredictor()
+        self._last_robot_x_mm = config.HOME_X   # updated on every FK publish
 
         # ── subscribers ───────────────────────────────────────────────────────
         self._sub_target = self.create_subscription(
@@ -477,23 +619,32 @@ class MatlabBridgeNode(Node):
     # ── callbacks ─────────────────────────────────────────────────────────────
 
     def _on_target_xyz(self, msg: PointStamped) -> None:
+        detect_time = time.time()
         x = msg.point.x   # metres, robot base frame
         y = msg.point.y
         z = msg.point.z
 
-        # Replace z with real RealSense depth when available
-        real = self._reproject_with_real_depth(x, y, z)
+        # Replace z with real depth-camera depth when available — except in
+        # weed_seg mode, where /delta/target_xyz's z already comes from
+        # plant_perception's MAD-filtered root-depth estimate (robust for a
+        # noisy/holed weed root, unlike this rigid-disk method which assumes
+        # a flat cube top). Re-sampling at a re-projected pixel here would be
+        # redundant and can disagree with the better upstream estimate.
+        # Also skipped entirely when FAKE_DEPTH_ENABLE is on — re-sampling
+        # real depth here would overwrite the fake z upstream already set.
+        skip_real_depth = config.FAKE_DEPTH_ENABLE or config.DETECTION_MODE == "weed_seg"
+        real = None if skip_real_depth else self._reproject_with_real_depth(x, y, z)
         if real is not None:
             x_real, y_real, z_real = real
             self.get_logger().info(
-                f"RealSense depth: z_fake={z * 1000.0:.1f} mm → "
+                f"Depth camera: z_fake={z * 1000.0:.1f} mm → "
                 f"z_real={z_real * 1000.0:.1f} mm  "
                 f"(Δ={abs(z_real - z) * 1000.0:.1f} mm)"
             )
             x, y, z = x_real, y_real, z_real
-        else:
+        elif not skip_real_depth:
             self.get_logger().warn(
-                "RealSense depth unavailable — using z from /delta/target_xyz "
+                "Depth camera unavailable — using z from /delta/target_xyz "
                 f"(z={z * 1000.0:.1f} mm)"
             )
 
@@ -509,19 +660,42 @@ class MatlabBridgeNode(Node):
                 f"(buf={len(self._z_history)})"
             )
 
-        if not self._fsm.on_target(x, y, z):
-            if not self._fsm.update_target(x, y, z):
-                self.get_logger().warn(
-                    f"Target ({x * 1000.0:.1f},{y * 1000.0:.1f},{z * 1000.0:.1f}) mm "
-                    f"dropped — robot busy (state={self._fsm.state})"
+        # Belt-velocity prediction: replace raw detected X with the predicted
+        # pick-time X, accounting for belt motion during the robot's
+        # travel+descend time. Feed the regression on every detection so the
+        # window stays populated even while busy (main_app.py's same pattern).
+        if config.BELT_PREDICTION_ENABLE:
+            x_mm_raw = x * 1000.0
+            self._predictor.update_velocity(x_mm_raw, detect_time)
+            pred = self._predictor.predict(y * 1000.0, x_mm_raw, self._last_robot_x_mm)
+            if pred.valid:
+                self.get_logger().info(
+                    f"Belt predict: x_detected={x_mm_raw:.1f}mm → x_pick={pred.x_pick:.1f}mm "
+                    f"(vx={pred.vx_mm_s:.1f}mm/s, t_total={pred.t_total:.2f}s, "
+                    f"belt_offset={pred.belt_offset:.1f}mm)"
                 )
-            return
+                x = pred.x_pick / 1000.0
+            else:
+                self.get_logger().debug(
+                    f"Belt predict: invalid (x_pick={pred.x_pick:.1f}mm outside workspace, "
+                    f"vx={pred.vx_mm_s:.1f}mm/s, t_total={pred.t_total:.2f}s, "
+                    f"belt_offset={pred.belt_offset:.1f}mm) — using raw detected X"
+                )
 
-        # Convert EE-tip Z (from camera) to platform Z for the IK solver.
-        # move_thetas positions the platform; the EE tip is EE_OFFSET_Z_MM below it.
-        x_mm = float(x) * 1000.0
-        y_mm = float(y) * 1000.0
-        z_eetip_mm = float(z) * 1000.0
+        if not self._fsm.on_target(x, y, z, detect_time=detect_time):
+            if not self._fsm.update_target(x, y, z, detect_time=detect_time):
+                self.get_logger().info(
+                    f"Target ({x * 1000.0:.1f},{y * 1000.0:.1f},{z * 1000.0:.1f}) mm "
+                    f"queued as next pick (state={self._fsm.state})"
+                )
+
+    def _send_target_to_matlab(self, x_m: float, y_m: float, z_m: float) -> None:
+        """Convert EE-tip metres to platform-frame mm and publish DeltaTarget
+        to MATLAB. Called by the FSM both for a freshly-accepted target and
+        for one chained straight from PLACING into the next pick."""
+        x_mm = float(x_m) * 1000.0
+        y_mm = float(y_m) * 1000.0
+        z_eetip_mm = float(z_m) * 1000.0
         z_platform_mm = (
             z_eetip_mm + config.EE_OFFSET_Z_MM + Z_DROP_EXTRA_MM
         )  # e.g. -670 + 150 - 15 = -535
@@ -551,10 +725,12 @@ class MatlabBridgeNode(Node):
             msg.theta1_deg, msg.theta2_deg, msg.theta3_deg, msg.ik_valid
         )
 
-    # ── RealSense depth callbacks ─────────────────────────────────────────────
+    # ── depth camera callbacks (unused — no depth stream) ───────────────────
 
     def _on_depth_image(self, msg: Image) -> None:
-        arr = np.frombuffer(bytes(msg.data), dtype=np.uint16).reshape(msg.height, msg.width)
+        # msg.data (array.array) already supports the buffer protocol —
+        # wrapping it in bytes() forced a full HxW copy on every depth frame.
+        arr = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
         with self._depth_lock:
             self._depth_image = arr
 
@@ -585,11 +761,11 @@ class MatlabBridgeNode(Node):
         return float(np.median(self._z_history))
 
     def _reproject_with_real_depth(self, x_m: float, y_m: float, z_m: float):
-        """Replace z using real RealSense depth.
+        """Replace z using real depth-camera depth.
 
-        Projects base-frame XYZ to an image pixel, samples depth in an annular
-        ring around the centroid (skipping the plant-top hole) at the soil-biased
-        percentile, then re-deprojects to base frame.
+        Projects base-frame XYZ to an image pixel, samples depth in a small disk
+        centred on the object (its own top surface, not the surrounding belt),
+        then re-deprojects to base frame.
 
         Returns (x_m, y_m, z_real_m) or None if depth is unavailable.
         """
@@ -599,7 +775,7 @@ class MatlabBridgeNode(Node):
         with self._depth_lock:
             depth_img = self._depth_image
         if depth_img is None:
-            self.get_logger().warn("RealSense depth image not yet received")
+            self.get_logger().warn("Depth image not yet received")
             return None
 
         # metres → mm, then base frame → camera frame
@@ -619,59 +795,63 @@ class MatlabBridgeNode(Node):
             )
             return None
 
-        # ── Terrain/vegetation depth sampling ────────────────────────────────
-        # Vegetation causes IR depth holes directly over plants.  Strategy:
-        #   1. Sample an annular ring (skip inner Z_ANNULUS_INNER_R_PX pixels
-        #      which cover the plant top / hole).  The ring captures surrounding
-        #      soil/root-level returns.
-        #   2. Use Z_SOIL_PERCENTILE (>50) to bias toward deeper returns — the
-        #      ground surface is always deeper than raised leaf/stem tips.
-        #   3. Fall back to full-patch median only if the annular ring is empty
-        #      (e.g. plant too close to image border).
+        # ── Rigid-object depth sampling ──────────────────────────────────────
+        # The object's own top surface is the reliable reading here (unlike
+        # vegetation, there's no depth hole over a rigid block). Strategy:
+        #   1. Sample a small disk centred on the centroid, radius
+        #      RIGID_Z_SAMPLE_R_PX — must stay inside the object's own
+        #      footprint so it doesn't pick up the surrounding belt.
+        #   2. Take the median (RIGID_Z_PERCENTILE) of that disk's returns.
+        #   3. Fall back to full-patch median only if the disk is empty
+        #      (e.g. object too close to image border).
         z_cam_mm = None
-        inner_r = Z_ANNULUS_INNER_R_PX
-        outer_r = Z_ANNULUS_OUTER_R_PX
+        r = RIGID_Z_SAMPLE_R_PX
 
-        y0 = max(0, v - outer_r);  y1 = min(h, v + outer_r + 1)
-        x0 = max(0, u - outer_r);  x1 = min(w, u + outer_r + 1)
+        y0 = max(0, v - r);  y1 = min(h, v + r + 1)
+        x0 = max(0, u - r);  x1 = min(w, u + r + 1)
         patch = depth_img[y0:y1, x0:x1].astype(np.float32)
 
-        # Per-pixel distance from centroid to build the annular mask.
-        rows = (np.arange(y0, y1) - v)[:, None]
-        cols = (np.arange(x0, x1) - u)[None, :]
-        dist = np.sqrt(rows ** 2 + cols ** 2)
+        # Slice the precomputed disk mask by the same offsets used to clip
+        # the patch — avoids rebuilding the rows/cols/sqrt distance grid here
+        # on every call (the disk geometry never changes, only where it gets
+        # cropped near image borders).
+        disk_mask = self._disk_mask_full[
+            y0 - v + r : y1 - v + r,
+            x0 - u + r : x1 - u + r,
+        ]
 
-        # Annular ring: between inner_r and outer_r
-        ring_flat  = patch[( dist >= inner_r) & (dist <= outer_r)].flatten()
-        valid_ring = ring_flat[(ring_flat > 1.0) & (ring_flat < 10_000.0)]
+        # Boolean-mask indexing already returns a flat 1-D copy, so no extra
+        # .flatten() needed.
+        disk_flat  = patch[disk_mask]
+        valid_disk = disk_flat[(disk_flat > 1.0) & (disk_flat < 10_000.0)]
 
-        if len(valid_ring) >= Z_MIN_VALID_PX:
+        if len(valid_disk) >= Z_MIN_VALID_PX:
             # Reject background: values more than Z_BG_REJECT_MM beyond the
-            # shallowest ring return are likely through-surface or room clutter.
-            fg_ring = valid_ring[valid_ring <= valid_ring.min() + Z_BG_REJECT_MM]
-            use = fg_ring if len(fg_ring) >= Z_MIN_VALID_PX else valid_ring
-            z_cam_mm = float(np.percentile(use, Z_SOIL_PERCENTILE))
+            # shallowest disk return are likely through-surface or room clutter.
+            fg_disk = valid_disk[valid_disk <= valid_disk.min() + Z_BG_REJECT_MM]
+            use = fg_disk if len(fg_disk) >= Z_MIN_VALID_PX else valid_disk
+            z_cam_mm = float(np.percentile(use, RIGID_Z_PERCENTILE))
             self.get_logger().debug(
-                f"Terrain Z (annular ring, n={len(use)}/{len(valid_ring)}): "
+                f"Object Z (disk, n={len(use)}/{len(valid_disk)}): "
                 f"{z_cam_mm:.1f} mm"
             )
         else:
-            # Ring is empty or too sparse — fall back to full-patch median
-            # (may happen near image borders or with very dense canopy).
+            # Disk is empty or too sparse — fall back to full-patch median
+            # (may happen near image borders).
             full_flat  = patch.flatten()
             valid_full = full_flat[(full_flat > 1.0) & (full_flat < 10_000.0)]
             if len(valid_full) >= Z_MIN_VALID_PX:
                 fg_full = valid_full[valid_full <= valid_full.min() + Z_BG_REJECT_MM]
                 use = fg_full if len(fg_full) >= Z_MIN_VALID_PX else valid_full
-                z_cam_mm = float(np.percentile(use, Z_SOIL_PERCENTILE))
+                z_cam_mm = float(np.percentile(use, RIGID_Z_PERCENTILE))
                 self.get_logger().debug(
-                    f"Terrain Z (full patch fallback, n={len(use)}): "
+                    f"Object Z (full patch fallback, n={len(use)}): "
                     f"{z_cam_mm:.1f} mm"
                 )
             else:
                 self.get_logger().warn(
                     f"No valid depth at pixel ({u},{v}) — "
-                    f"ring={len(valid_ring)} px, full={len(valid_full)} px"
+                    f"disk={len(valid_disk)} px, full={len(valid_full)} px"
                 )
                 return None
 
@@ -688,6 +868,11 @@ class MatlabBridgeNode(Node):
         m.data = state
         self._pub_state.publish(m)
 
+    def _send_gripper(self, pos: float) -> None:
+        m = Float32()
+        m.data = float(pos)
+        self._pub_gripper_cmd.publish(m)
+
     def _send_motor_thetas(self, fb_deg, ok: bool) -> None:
         """Publish actual motor-encoder thetas (CAN feedback) back to MATLAB."""
         if fb_deg is None:
@@ -700,9 +885,11 @@ class MatlabBridgeNode(Node):
         m.theta3_deg = float(fb_deg[2])
         m.ik_valid   = bool(ok)
         self._pub_motor_thetas.publish(m)
+        self._publish_joint_states(fb_deg)
 
     def _send_fk(self, x: float, y: float, z: float) -> None:
-        """x, y, z are PLATFORM coordinates from delta_calcForward."""
+        """x, y, z are PLATFORM coordinates from solve_fk_mm."""
+        self._last_robot_x_mm = float(x)
         pt = PointStamped()
         pt.header.stamp    = self.get_clock().now().to_msg()
         pt.header.frame_id = "robot_base"
@@ -719,19 +906,33 @@ class MatlabBridgeNode(Node):
         pt_ee.point.z = float(z) - config.EE_OFFSET_Z_MM
         self._pub_ee_fk.publish(pt_ee)
 
+    def _publish_joint_states(self, fb_deg) -> None:
+        """Publish full 12-joint /joint_states from the 3 live shoulder thetas."""
+        thetas_rad = [math.radians(t) for t in fb_deg]
+        values = joint_state(self._joint_geom, thetas_rad)
+        if values is None:
+            return
+        msg = JointState()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = list(JOINT_NAMES)
+        msg.position = [values[name] for name in JOINT_NAMES]
+        self._pub_joint_states.publish(msg)
+
     def _publish_fk_heartbeat(self) -> None:
-        """Refresh /delta/ee_fk_xyz and /delta/ee_position_mm from live FK."""
+        """Refresh /delta/ee_fk_xyz, /delta/ee_position_mm and /joint_states from live CAN feedback."""
         if not config.ENABLE_MOTORS or not self._ctrl.connected:
             return
-        # _run_move drives the same CAN bus from a background thread during
-        # APPROACHING/MOVING/RESETTING; polling here concurrently can steal
-        # its response frame and leave that thread blocked forever on a CAN
-        # read with no timeout (bus.read() -> receive() has none). _run_move
-        # already publishes fresh FK after every move, so skip while busy.
+        # _run_move/_run_home_and_release drive the same CAN bus from a background thread
+        # while busy; polling here concurrently can steal its response frame
+        # and leave that thread blocked forever on a CAN read with no timeout
+        # (bus.read() -> receive() has none). Those paths already publish
+        # fresh FK after every move, so skip while busy.
         if self._fsm.state != "IDLE":
             return
         try:
-            ok, x, y, z = self._ctrl.get_current_xyz()   # platform mm
+            fb_deg = self._ctrl.get_current_thetas_deg()
+            self._publish_joint_states(fb_deg)
+            ok, x, y, z = solve_fk_mm(*fb_deg)   # platform mm
             if ok:
                 self._send_fk(x, y, z)
                 # /delta/ee_position_mm — EE-tip coordinates in mm.
@@ -749,12 +950,14 @@ class MatlabBridgeNode(Node):
 
     def destroy_node(self) -> None:
         if config.ENABLE_MOTORS and self._explicit_shutdown:
+            self._gripper.release(wait=False)
             try:
                 self._ctrl.move_thetas(0.0, 0.0, 0.0)   # exact θ=0,0,0 home
                 time.sleep(0.5)
             except Exception:
                 pass
             self._ctrl.shutdown()
+            self._gripper.disconnect()
         super().destroy_node()
 
 

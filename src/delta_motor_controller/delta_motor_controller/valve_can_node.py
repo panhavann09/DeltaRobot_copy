@@ -8,7 +8,6 @@ from custom_messages.msg import (
     DigitalAndAnalogFeedback,
     DigitalAndSolenoidCommand,
 )
-from dc_gamepad_msgs.msg import GamePad
 
 
 class SolenoidControlNode(Node):
@@ -44,18 +43,7 @@ class SolenoidControlNode(Node):
             '/publish_digital_solenoid',
             10,
         )
-        self.sensor_subscription = self.create_subscription(
-            DigitalAndAnalogFeedback,
-            '/digital_analog_feedback',
-            self.digital_and_analog_callback,
-            10,
-        )
-        self.gamepad_subscription = self.create_subscription(
-            GamePad,
-            '/pad',
-            self.gamepad_callback,
-            10,
-        )
+
 
     def _cancel_cycle(self):
         self.dribbling = False
@@ -131,10 +119,17 @@ class SolenoidControlNode(Node):
             self.start_detect = True
 
     def publish_solenoid(self):
+        # Only solenoid1 (hand) is actually wired on this board — every other
+        # solenoid bit must always stay False, regardless of the push/dribble
+        # state machine above.
         solenoid_msg = DigitalAndSolenoidCommand()
         solenoid_msg.can_id = self.PUBLISH_CAN_ID
-        solenoid_msg.solenoid1_value = self.solenoid_push
-        solenoid_msg.solenoid2_value = self.solenoid_hand
+        solenoid_msg.solenoid1_value = self.solenoid_hand
+        solenoid_msg.solenoid2_value = False
+        solenoid_msg.solenoid3_value = False
+        solenoid_msg.solenoid4_value = False
+        solenoid_msg.solenoid5_value = False
+        solenoid_msg.solenoid6_value = False
         self.solenoid_publisher.publish(solenoid_msg)
 
 
@@ -154,3 +149,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+

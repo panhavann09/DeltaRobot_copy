@@ -1,4 +1,4 @@
-# CHANGES: [D455 default] disable accel/gyro IMU, set conservative 640x480x15 profiles
+# CHANGES: [global shutter] replaced realsense2_camera_node with uvc_camera_publisher (no depth)
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
@@ -6,24 +6,20 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    color_profile = LaunchConfiguration("color_profile")
-    depth_profile = LaunchConfiguration("depth_profile")
-    align_depth_enable = LaunchConfiguration("align_depth_enable")
-    enable_accel = LaunchConfiguration("enable_accel")
-    enable_gyro = LaunchConfiguration("enable_gyro")
-    unite_imu_method = LaunchConfiguration("unite_imu_method")
+    camera_device = LaunchConfiguration("camera_device")
+    camera_width = LaunchConfiguration("camera_width")
+    camera_height = LaunchConfiguration("camera_height")
+    camera_fps = LaunchConfiguration("camera_fps")
 
-    realsense = Node(
-        package="realsense2_camera",
-        executable="realsense2_camera_node",
+    uvc_camera = Node(
+        package="delta_camera_system",
+        executable="uvc_camera_publisher",
         namespace="camera",
         parameters=[{
-            "align_depth.enable": align_depth_enable,
-            "rgb_camera.color_profile": color_profile,
-            "depth_module.depth_profile": depth_profile,
-            "enable_accel": enable_accel,
-            "enable_gyro": enable_gyro,
-            "unite_imu_method": unite_imu_method,
+            "camera_device": camera_device,
+            "camera_width": camera_width,
+            "camera_height": camera_height,
+            "camera_fps": camera_fps,
         }],
         output="screen",
     )
@@ -35,12 +31,10 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument("align_depth_enable", default_value="true"),
-        DeclareLaunchArgument("color_profile", default_value="640x480x15"),
-        DeclareLaunchArgument("depth_profile", default_value="640x480x15"),
-        DeclareLaunchArgument("enable_accel", default_value="false"),
-        DeclareLaunchArgument("enable_gyro", default_value="false"),
-        DeclareLaunchArgument("unite_imu_method", default_value="0"),
-        realsense,
+        DeclareLaunchArgument("camera_device", default_value="/dev/video0"),
+        DeclareLaunchArgument("camera_width", default_value="640"),
+        DeclareLaunchArgument("camera_height", default_value="480"),
+        DeclareLaunchArgument("camera_fps", default_value="30"),
+        uvc_camera,
         camera_node,
     ])

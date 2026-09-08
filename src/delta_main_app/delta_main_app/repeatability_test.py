@@ -17,10 +17,22 @@ Paper's experiment
         Fig 15 — end-effector XY scatter + 2σ ellipse, per position
         Fig 16 — θ vs time (experiment=blue vs IK=red) for whole sequence
 
-Run directly — no ROS launch needed:
-    python3 repeatability_test.py
+Run directly — no ROS launch needed, no camera/main_app/matlab_bridge_node
+required (this script drives the arm itself via DeltaMotorController):
+    python3 repeatability_test.py --run-label static
+    python3 repeatability_test.py --run-label moving
+config.ADRC_BIAS_ENABLE is read at startup and stamped into the output
+filename/console header automatically (bias_observer's d_hat lives inside
+DeltaMotorController, so it applies here too) — set it in config.py and
+restart between runs to cover bias on/off.  --run-label just tags the belt
+condition for the filename; since this script never looks at the belt (no
+camera), "moving" means physically running the conveyor idle in the
+background while the arm does the same point-to-point moves, to see
+whether belt vibration disturbs positioning — the script does not start/
+stop it for you.
 """
 
+import argparse
 import csv
 import math
 import os
@@ -28,22 +40,35 @@ import time
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
-from delta_common.fk_ik import check_workspace, delta_calcInverse, e, f, re, rf
+from delta_common import config
+from delta_common.fk_ik import check_workspace, solve_ik_mm
 from delta_motor_controller.motor_controller import DeltaMotorController
 
 # ── Parameters — match these to the paper ─────────────────────────────────────
 
-EXPERIMENT_Z_MM = -400.0   # Z=-400: 150mm X/Y reach while all motors stay below 54°
+EXPERIMENT_Z_MM = -450.0   # tip-frame Z; move_xyz adds EE_OFFSET_Z_MM(150) -> platform
+                            # Z=-300 (config.py current value — re-verify this comment
+                            # if EE_OFFSET_Z_MM ever changes, it has drifted out of sync
+                            # with config.py before)
 
 HOME_X, HOME_Y = 0.0, 0.0
 
-# Positions chosen so ALL motors stay below 54° (actual hardware limit ~56°).
-# At Z=-400 with ±60mm targets, max theta ~35° — well within range.
+# THETA1/2/3_MIN=-5deg (config.py) bounds the reachable envelope at
+# EXPERIMENT_Z_MM — re-verified 2026-08-22 by calling solve_ik_mm()/
+# check_workspace() directly at the real platform Z=-300 for every point
+# below; each keeps >=3.99deg margin on every joint against both the -5deg
+# and 90deg limits.
 TARGET_POSITIONS: List[Tuple[float, float]] = [
-    (   0.0,   60.0),   # pos1  +Y
-    ( -60.0,    0.0),   # pos2  -X
-    ( -60.0,  -60.0),   # pos3  -X-Y
-    (  60.0,    0.0),   # pos4  +X
+    (   0.0,   50.0),   # pos1  +Y                    thetas=(18.3,29.8, 5.6) margin 10.57deg
+    ( -50.0,    0.0),   # pos2  -X                     thetas=( 3.5,25.1,25.1) margin 8.51deg
+    ( -50.0,  -50.0),   # pos3  -X-Y                   thetas=( 4.7,14.2,36.8) margin 9.68deg
+    (  50.0,    0.0),   # pos4  +X                     thetas=(31.4,11.1,11.1) margin 16.07deg
+    ( -50.0,   100.0),  # pos5  edge -X+Y (120deg spoke, r=30) thetas=( 8.2,49.0, 4.6) margin 9.64deg
+    (   0.0,  -50.0),   # pos6  -Y                     thetas=(18.3, 5.6,29.8) margin 10.57deg
+    (  50.0,   50.0),   # pos7  +X+Y                   thetas=(32.5,24.4,-1.0) margin 3.99deg
+    (  50.0,  -50.0),   # pos8  +X-Y                   thetas=(32.5,-1.0,24.4) margin 3.99deg
+    ( -50.0,   50.0),   # pos9  -X+Y                   thetas=( 4.7,36.8,14.2) margin 9.68deg
+    ( -50.0,  -100.0),  # pos10 edge -X-Y (240deg spoke, r=30) thetas=( 8.2, 4.6,49.0) margin 9.64deg
 ]
 
 N_REPEATS   = 6      # paper uses 6
@@ -61,19 +86,37 @@ OUTPUT_DIR = os.path.expanduser("~/delta_ws/experiment_results")
 
 def _ik_angles(x: float, y: float, z: float) -> Optional[Tuple[float, float, float]]:
     """Return (θ1, θ2, θ3) in degrees from IK, or None on failure."""
-    st, t1, t2, t3 = delta_calcInverse(x, y, z, e, f, re, rf)
-    return (t1, t2, t3) if st == 0 else None
+    ok, t1, t2, t3 = solve_ik_mm(x, y, z)
+    return (t1, t2, t3) if ok else None
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    motor = DeltaMotorController(vel_max=VEL_MAX, acc_set=ACC_SET)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run-label", default="static",
+                         help="belt condition tag for the output filename, "
+                              "e.g. static / moving (default: static)")
+    parser.add_argument("--control-mode", default="pp", choices=["pp", "mit"],
+                         help="motor control mode: pp = Profile Position (default, "
+                              "unchanged behavior), mit = Operation Control mode "
+                              "(thesis Table 4.2 run_mode=0), for the PP-vs-MIT "
+                              "comparison. See config.MIT_* for gains/profile.")
+    args = parser.parse_args()
+
+    bias_on = bool(config.ADRC_BIAS_ENABLE)
+    bias_tag = "bias_on" if bias_on else "bias_off"
+
+    motor = DeltaMotorController(vel_max=VEL_MAX, acc_set=ACC_SET,
+                                  control_mode=args.control_mode)
     motor.connect()
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = os.path.join(OUTPUT_DIR, f"repeatability_{ts}.csv")
+    csv_path = os.path.join(
+        OUTPUT_DIR,
+        f"repeatability_{args.run_label}_{args.control_mode}_{bias_tag}_{ts}.csv"
+    )
 
     # stopped_log  : one row per target stop (for Table IV/V and Figs 14, 15)
     # timeline_log : one row per motion event (for Fig 16)
@@ -82,8 +125,15 @@ def main():
 
     print(f"\n{'='*62}")
     print(f"  Point-to-Point Tracking Repeatability (paper Sec. III-B)")
+    print(f"  control_mode={args.control_mode}  run_label={args.run_label}  "
+          f"ADRC_BIAS_ENABLE={bias_on}")
     print(f"  {len(TARGET_POSITIONS)} targets × {N_REPEATS} repeats")
-    print(f"  Z = {EXPERIMENT_Z_MM} mm    VEL={VEL_MAX} rad/s  ACC={ACC_SET} rad/s²")
+    if args.control_mode == "mit":
+        print(f"  Z = {EXPERIMENT_Z_MM} mm    "
+              f"MIT_V_MAX={config.MIT_V_MAX_MMPS} mm/s  MIT_A_MAX={config.MIT_A_MAX_MMPS2} mm/s²  "
+              f"Kp={config.MIT_KP}  Kd={config.MIT_KD}")
+    else:
+        print(f"  Z = {EXPERIMENT_Z_MM} mm    VEL={VEL_MAX} rad/s  ACC={ACC_SET} rad/s²")
     print(f"{'='*62}")
 
     t_start = time.monotonic()
@@ -105,7 +155,7 @@ def main():
         })
 
     # ── Home ──────────────────────────────────────────────────────────────────
-    ok, ik0, fb0, fk0, _ = motor.move_xyz(HOME_X, HOME_Y, EXPERIMENT_Z_MM)
+    ok, ik0, fb0, fk0, _ = motor.move(HOME_X, HOME_Y, EXPERIMENT_Z_MM)
     time.sleep(1.5)
     _record_timeline("home_init", HOME_X, HOME_Y, ik0, fb0, fk0)
 
@@ -125,7 +175,7 @@ def main():
 
         for rep in range(N_REPEATS):
             # ── HOME → TARGET ─────────────────────────────────────────────
-            ok, ik_t, fb_t, fk_t, _ = motor.move_xyz(
+            ok, ik_t, fb_t, fk_t, _ = motor.move(
                 x_tgt, y_tgt, EXPERIMENT_Z_MM
             )
             time.sleep(SETTLE_TIME)
@@ -165,7 +215,7 @@ def main():
             })
 
             # ── TARGET → HOME ─────────────────────────────────────────────
-            ok, ik_h, fb_h, fk_h, _ = motor.move_xyz(
+            ok, ik_h, fb_h, fk_h, _ = motor.move(
                 HOME_X, HOME_Y, EXPERIMENT_Z_MM
             )
             time.sleep(SETTLE_TIME)

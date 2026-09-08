@@ -1,0 +1,203 @@
+<?xml version="1.0"?>
+<robot name="delta_robot" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- Geometry constants — MUST stay in sync with DeltaGeometry defaults in
+       delta_common/delta_common/fk_ik.py. Do not tune these here; if the real
+       robot's geometry changes, update fk_ik.py first and mirror the values. -->
+  <xacro:property name="base_radius" value="0.16321"/>       <!-- base centre -> shoulder axis -->
+  <xacro:property name="platform_radius" value="0.035"/>     <!-- platform centre -> forearm attach -->
+  <xacro:property name="bicep_length" value="0.200"/>        <!-- shoulder -> elbow -->
+  <xacro:property name="forearm_length" value="0.400"/>      <!-- elbow -> platform attach -->
+  <xacro:property name="ee_offset" value="0.150"/>           <!-- gripper length below platform, config.EE_OFFSET_Z_MM -->
+
+  <!-- Shoulder joint limits — config.THETA1_MIN/MAX (same range for all 3 arms) -->
+  <xacro:property name="theta_min" value="${-5*pi/180.0}"/>
+  <xacro:property name="theta_max" value="${90*pi/180.0}"/>
+
+  <!-- Visual-only rod/disk radii — no physical measurement backs these, purely for legibility -->
+  <xacro:property name="bicep_vis_r" value="0.012"/>
+  <xacro:property name="forearm_vis_r" value="0.010"/>
+  <xacro:property name="ee_vis_r" value="0.010"/>
+
+  <material name="grey"><color rgba="0.55 0.55 0.58 1.0"/></material>
+  <material name="bicep_blue"><color rgba="0.15 0.35 0.75 1.0"/></material>
+  <material name="forearm_orange"><color rgba="0.90 0.45 0.10 1.0"/></material>
+  <material name="platform_teal"><color rgba="0.10 0.55 0.50 1.0"/></material>
+  <material name="ee_dark"><color rgba="0.20 0.20 0.22 1.0"/></material>
+
+  <!-- Stand height: base_link sits this high above the floor. Visualization-only
+       (no physical measurement backs it) — adjust to match the real mounting frame. -->
+  <xacro:property name="stand_height" value="0.5"/>
+
+  <!-- Floor frame — RViz's Grid is drawn at the fixed frame's z=0, so use "world"
+       as the fixed frame in RViz to see the robot mounted stand_height above the floor. -->
+  <link name="world"/>
+  <joint name="world_to_base" type="fixed">
+    <parent link="world"/>
+    <child link="base_link"/>
+    <origin xyz="0 0 ${stand_height}" rpy="0 0 0"/>
+  </joint>
+
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><cylinder radius="${base_radius + 0.02}" length="0.02"/></geometry>
+      <material name="grey"/>
+    </visual>
+  </link>
+
+  <!-- ═══ Arm chain macro ═══
+       Each arm is an open chain base_link -> shoulder (active, revolute about
+       local Y) -> elbow_yaw -> elbow_pitch (both passive, revolute) -> forearm
+       tip. This reproduces fk_ik.py's elbow_position()/passive_angles(): the
+       elbow_yaw/elbow_pitch joint values published by joint_state_bridge make
+       each forearm tip land exactly on the platform's attach point, so the
+       arm and platform branches (which are NOT physically connected in this
+       URDF, since a closed kinematic loop can't be expressed here) render as
+       a seamless linkage as long as the bridge node stays consistent. -->
+  <xacro:macro name="delta_arm" params="idx azimuth_deg">
+    <link name="arm${idx}_shoulder_frame"/>
+    <joint name="arm${idx}_base_joint" type="fixed">
+      <parent link="base_link"/>
+      <child link="arm${idx}_shoulder_frame"/>
+      <origin xyz="${base_radius*cos(azimuth_deg*pi/180.0)} ${base_radius*sin(azimuth_deg*pi/180.0)} 0"
+              rpy="0 0 ${azimuth_deg*pi/180.0}"/>
+    </joint>
+
+    <link name="arm${idx}_bicep_link">
+      <visual>
+        <origin xyz="${bicep_length/2.0} 0 0" rpy="0 1.5707963 0"/>
+        <geometry><cylinder radius="${bicep_vis_r}" length="${bicep_length}"/></geometry>
+        <material name="bicep_blue"/>
+      </visual>
+    </link>
+    <joint name="arm${idx}_shoulder" type="revolute">
+      <parent link="arm${idx}_shoulder_frame"/>
+      <child link="arm${idx}_bicep_link"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+      <limit lower="${theta_min}" upper="${theta_max}" effort="50" velocity="3.0"/>
+    </joint>
+
+    <link name="arm${idx}_elbow_frame"/>
+    <joint name="arm${idx}_elbow_yaw" type="continuous">
+      <parent link="arm${idx}_bicep_link"/>
+      <child link="arm${idx}_elbow_frame"/>
+      <origin xyz="${bicep_length} 0 0" rpy="0 0 0"/>
+      <axis xyz="0 0 1"/>
+    </joint>
+
+    <link name="arm${idx}_forearm_link">
+      <visual>
+        <origin xyz="${forearm_length/2.0} 0 0" rpy="0 1.5707963 0"/>
+        <geometry><cylinder radius="${forearm_vis_r}" length="${forearm_length}"/></geometry>
+        <material name="forearm_orange"/>
+      </visual>
+    </link>
+    <joint name="arm${idx}_elbow_pitch" type="continuous">
+      <parent link="arm${idx}_elbow_frame"/>
+      <child link="arm${idx}_forearm_link"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+    </joint>
+  </xacro:macro>
+
+  <!-- azimuths_deg = (180, 300, 60) — rotated 180deg from the naive (0,120,240)
+       to match the physical robot's mounting. MUST match fk_ik.DeltaGeometry. -->
+  <xacro:delta_arm idx="1" azimuth_deg="180.0"/>
+  <xacro:delta_arm idx="2" azimuth_deg="300.0"/>
+  <xacro:delta_arm idx="3" azimuth_deg="60.0"/>
+
+  <!-- ═══ Platform branch ═══
+       Not physically connected to the arms above (URDF can't express the
+       closed loop). platform_x/y/z are prismatic joints stacked along
+       base_link's own X/Y/Z axes, so their summed translation reproduces the
+       platform-centre position from fk_ik.forward_kinematics() directly, in
+       metres. joint_state_bridge publishes these alongside the arm joints
+       from the same FK/IK call so the two branches stay geometrically
+       consistent. -->
+  <link name="platform_x_link"/>
+  <joint name="platform_x" type="prismatic">
+    <parent link="base_link"/>
+    <child link="platform_x_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-0.3" upper="0.3" effort="0" velocity="1.0"/>
+  </joint>
+
+  <link name="platform_y_link"/>
+  <joint name="platform_y" type="prismatic">
+    <parent link="platform_x_link"/>
+    <child link="platform_y_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-0.3" upper="0.3" effort="0" velocity="1.0"/>
+  </joint>
+
+  <link name="platform_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><cylinder radius="${platform_radius + 0.03}" length="0.015"/></geometry>
+      <material name="platform_teal"/>
+    </visual>
+  </link>
+  <joint name="platform_z" type="prismatic">
+    <parent link="platform_y_link"/>
+    <child link="platform_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-0.8" upper="0.0" effort="0" velocity="1.0"/>
+  </joint>
+
+  <link name="ee_link">
+    <visual>
+      <origin xyz="0 0 ${-ee_offset/2.0}" rpy="0 0 0"/>
+      <geometry><cylinder radius="${ee_vis_r}" length="${ee_offset}"/></geometry>
+      <material name="ee_dark"/>
+    </visual>
+  </link>
+  <joint name="ee_joint" type="fixed">
+    <parent link="platform_link"/>
+    <child link="ee_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ═══ Camera mount ═══
+       Named "camera_link" to match the real D455 driver's own root TF frame
+       (realsense2_camera_node publishes camera_link -> camera_color_frame ->
+       camera_color_optical_frame etc as static transforms, but never publishes
+       camera_link's own parent) — so this fixed joint and the driver's tree
+       merge into one consistent TF tree with no conflicting parent.
+
+       This joint places the physical camera_link (D455's own TF root, REP-103
+       convention: x=fwd, y=left, z=up) — NOT the optical frame directly, since
+       the live driver appends its own camera_link->camera_color_frame->
+       camera_color_optical_frame static transforms on top of this joint. The
+       values below are solved so that composing this joint with the driver's
+       actual measured extrinsics (camera_color_frame->camera_color_optical_frame
+       = quat(-0.5,0.5,-0.5,0.5); camera_link->camera_color_frame ~identity,
+       translation (-0.0003, -0.0592, 0.0)m from a live D455) reproduces the
+       intended base_link -> camera_color_optical_frame pose: config.CAM_TX_MM/
+       TY_MM/TZ_MM (207, 3, 0 mm) with rpy (pi, 0, pi/2) i.e. x_cam=right->
+       base +Y, y_cam=down->base +X, z_cam=depth->base -Z (camera looking
+       straight down at the belt), matching camera_system.py's pixel
+       deprojection convention. Solved as
+       T_joint = T_target @ inv(T_color_optical) @ inv(T_link_color); verified
+       numerically that composing T_joint with the driver's real extrinsics
+       reproduces the target pose to ~1e-8. Re-derive if CAM_TX/TY/TZ_MM,
+       CAMERA_DIRECT_MATRIX, or the camera mount change. -->
+  <link name="camera_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><box size="0.029 0.124 0.026"/></geometry>
+      <material name="ee_dark"/>
+    </visual>
+  </link>
+  <joint name="base_to_camera_link" type="fixed">
+    <parent link="base_link"/>
+    <child link="camera_link"/>
+    <origin xyz="0.207 -0.0562 -0.0003"
+            rpy="${pi} ${pi/2} 0"/>
+  </joint>
+
+</robot>

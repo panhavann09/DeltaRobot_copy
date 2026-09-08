@@ -1,5 +1,5 @@
 // Copyright 2022-2025 The MathWorks, Inc.
-// Generated 02-Jul-2026 13:41:50
+// Generated 22-Aug-2026 08:21:05
 #ifndef _SLROS2_INITIALIZE_H_
 #define _SLROS2_INITIALIZE_H_
 #include "sim4_ROS2_delta_types.h"
@@ -35,6 +35,4 @@ inline rclcpp::QoS getQOSSettingsFromRMW(const rmw_qos_profile_t& qosProfile) {
 extern SimulinkPublisher<custom_messages::msg::DeltaJointAngles,SL_Bus_custom_messages_DeltaJointAngles> Pub_sim4_ROS2_delta_72;
 // sim4_ROS2_delta/Subscribe2
 extern SimulinkSubscriber<custom_messages::msg::DeltaTarget,SL_Bus_custom_messages_DeltaTarget> Sub_sim4_ROS2_delta_75;
-// sim4_ROS2_delta/Subscribe3
-extern SimulinkSubscriber<geometry_msgs::msg::PointStamped,SL_Bus_geometry_msgs_PointStamped> Sub_sim4_ROS2_delta_76;
 #endif

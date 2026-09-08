@@ -7,12 +7,12 @@
 //
 // Code generated for Simulink model 'sim4_ROS2_delta'.
 //
-// Model version                  : 1.230
+// Model version                  : 1.367
 // Simulink Coder version         : 25.2 (R2025b) 28-Jul-2025
-// C/C++ source code generated on : Thu Jul  2 13:41:44 2026
+// C/C++ source code generated on : Sat Aug 22 08:20:52 2026
 //
 // Target selection: ert.tlc
-// Embedded hardware selection: AMD->x86-64 (Windows64)
+// Embedded hardware selection: ARM Compatible->ARM Cortex-A (64-bit)
 // Code generation objectives: Unspecified
 // Validation result: Not run
 //
@@ -95,34 +95,6 @@ struct SL_Bus_custom_messages_DeltaTarget
 
   // IsVarLen=1:VarLenCategory=length:VarLenElem=detection_mode
   SL_Bus_ROSVariableLengthArrayInfo detection_mode_SL_Info;
-};
-
-#endif
-
-#ifndef DEFINED_TYPEDEF_FOR_SL_Bus_geometry_msgs_Point_
-#define DEFINED_TYPEDEF_FOR_SL_Bus_geometry_msgs_Point_
-
-// MsgType=geometry_msgs/Point
-struct SL_Bus_geometry_msgs_Point
-{
-  real_T x;
-  real_T y;
-  real_T z;
-};
-
-#endif
-
-#ifndef DEFINED_TYPEDEF_FOR_SL_Bus_geometry_msgs_PointStamped_
-#define DEFINED_TYPEDEF_FOR_SL_Bus_geometry_msgs_PointStamped_
-
-// MsgType=geometry_msgs/PointStamped
-struct SL_Bus_geometry_msgs_PointStamped
-{
-  // MsgType=std_msgs/Header
-  SL_Bus_std_msgs_Header header;
-
-  // MsgType=geometry_msgs/Point
-  SL_Bus_geometry_msgs_Point point;
 };
 
 #endif

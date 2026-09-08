@@ -1,0 +1,73 @@
+# YOLO-Seg-Root perception node parameters — direct-camera-pipeline
+# variant (merge_code_test.py). Same detection/tracking/depth tuning as
+# perception.yaml, but camera_width/height/fps replace the ROS topic params
+# since this node opens the camera device itself (a UVC/V4L2 global-shutter
+# camera) instead of subscribing to a camera-driver ROS node.
+merge_code_test_node:
+  ros__parameters:
+    # Detection
+    model_path: "src/weight/best.engine"
+    imgsz: 640
+    conf_thres: 0.25
+    iou_thres: 0.45
+    device: "tensorrt"
+    trt_fp16_enable: false
+    target_fps: 30.0
+
+    # Tracking
+    tracker_type: "bytetrack"
+    track_high_thresh: 0.35
+    track_low_thresh: 0.10
+    new_track_thresh: 0.40
+    track_buffer: 15
+    match_thresh: 0.75
+    frame_rate: 15
+
+    # Track stability
+    minimum_confirm_hits: 3
+    maximum_publish_misses: 2
+    maximum_track_misses: 15
+    bbox_ema_alpha: 0.50
+    root_ema_alpha: 0.35
+    class_history_size: 5
+
+    # Segmentation
+    publish_masks: false
+
+    # Depth (no depth stream on the global-shutter camera)
+    use_depth: false
+    depth_window_size: 7
+    minimum_depth_valid_ratio: 0.40
+    minimum_depth_m: 0.10
+    maximum_depth_m: 3.00
+    depth_mad_multiplier: 2.5
+    depth_history_size: 5
+
+    # Visualization
+    enable_visualization: true
+    visualization_show_masks: false
+    visualization_jpeg_quality: 80
+
+    # Direct camera
+    camera_width: 640
+    camera_height: 480
+    camera_fps: 15
+    camera_device: "/dev/video0"
+    camera_fourcc: "MJPG"
+    # Chessboard calibration 2026-09-02, 14/16 captures (2 dropped: warped
+    # printed board), RMS reproj error 1.34px — see
+    # ~/delta_ws/camera_calibration/calibration_result.txt. Above the <0.5px
+    # target; recalibrate with the board mounted on something rigid if
+    # picking accuracy from pixel_to_camera_xyz_mm() looks off.
+    camera_fx: 520.1446
+    camera_fy: 516.2572
+    camera_cx: 320.4307
+    camera_cy: 265.6165
+    camera_dist_k1: -0.356508
+    camera_dist_k2: 0.004826
+    camera_dist_p1: -0.004085
+    camera_dist_p2: 0.003808
+    camera_dist_k3: 0.222601
+    tracked_plants_topic: "/plant_perception/tracked_plants"
+    visualization_topic: "/plant_perception/visualization"
+    camera_info_topic: "/camera/camera/color/camera_info"

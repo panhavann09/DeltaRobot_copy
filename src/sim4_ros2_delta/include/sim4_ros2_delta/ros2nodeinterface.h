@@ -4,9 +4,9 @@
 //
 // Code generated for Simulink model 'sim4_ROS2_delta'.
 //
-// Model version                  : 1.230
+// Model version                  : 1.367
 // Simulink Coder version         : 25.2 (R2025b) 28-Jul-2025
-// C/C++ source code generated on : Thu Jul 02 13:41:51 2026
+// C/C++ source code generated on : Sat Aug 22 08:21:06 2026
 //
 #ifndef _ROS2_MATLAB_NODEINTERFACE_
 #define _ROS2_MATLAB_NODEINTERFACE_
@@ -31,13 +31,11 @@ namespace executors{
 class SLMultiThreadedExecutor;
 }
 }
-#include "ext_mode.h"
-#include "rtwtypes.h"
+class sim4_ROS2_delta;
 #include "sim4_ROS2_delta_types.h"
+#include "rtwtypes.h"
 #include "custom_messages/msg/delta_joint_angles.hpp"
 #include "custom_messages/msg/delta_target.hpp"
-#include "geometry_msgs/msg/point_stamped.hpp"
-extern rclcpp::Node::SharedPtr SLROSNodePtr;
 namespace ros2 {
 namespace matlab {
   //Semaphore using std::CV and std::mutex
@@ -70,6 +68,9 @@ namespace matlab {
   class NodeInterface {
     NodeInterface(const NodeInterface& );
     NodeInterface& operator=(const NodeInterface& );
+    //
+    rclcpp::Node::SharedPtr mNode;
+    std::shared_ptr<sim4_ROS2_delta> mModel;
     std::shared_ptr<rclcpp::executors::SLMultiThreadedExecutor> mExec;
     //
     Semaphore mBaseRateSem;
@@ -80,8 +81,6 @@ namespace matlab {
     //
     Semaphore mStopSem;
     volatile boolean_T mRunModel;
-	// External mode background thread
-	std::shared_ptr<std::thread> mExtModeThread;
   public:
     NodeInterface();
     ~NodeInterface();
@@ -92,17 +91,34 @@ namespace matlab {
     void terminate(void);
     //
     boolean_T getStopRequestedFlag(void);
-	extmodeErrorCode_T errorCode;
-	void extmodeBackgroundTask(void);
     void schedulerThreadCallback(void);
     void baseRateTask(void);
     //
     rclcpp::Node::SharedPtr getNode() {
-      return SLROSNodePtr;
+      return mNode;
+    }
+    //
+    std::shared_ptr<sim4_ROS2_delta> getModel() {
+      return mModel;
     }
   }; //class NodeInterface
   //
   std::shared_ptr<ros2::matlab::NodeInterface> getNodeInterface();
+  // Get QoS Settings from RMW
+  inline rclcpp::QoS getQOSSettingsFromRMW(const rmw_qos_profile_t& qosProfile) {
+      rclcpp::QoS qos(rclcpp::QoSInitialization::from_rmw(qosProfile));
+      if (RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL == qosProfile.durability) {
+          qos.transient_local();
+      } else {
+          qos.durability_volatile();
+      }
+      if (RMW_QOS_POLICY_RELIABILITY_RELIABLE == qosProfile.reliability) {
+          qos.reliable();
+      } else {
+          qos.best_effort();
+      }
+      return qos;
+  }
 }//namespace matlab
 }//namespace ros2
 #ifdef _MSC_VER

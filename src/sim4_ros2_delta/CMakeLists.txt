@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.5)
 project(sim4_ros2_delta)
 set(CMAKE_VERBOSE_MAKEFILE ON)
 # Set CMAKE_BUILD_TYPE
-set(CMAKE_BUILD_TYPE Debug)
+set(CMAKE_BUILD_TYPE Release)
 set(MW_TOP_LEVEL_PROJECT_NAME ${PROJECT_NAME})
 # Default to C99
 if(NOT CMAKE_C_STANDARD)
@@ -33,43 +33,15 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_ros REQUIRED)
 find_package( custom_messages REQUIRED)
-find_package( geometry_msgs REQUIRED)
 find_package( rclcpp REQUIRED)
 # Add package include directories
 include_directories("${CMAKE_CURRENT_SOURCE_DIR}/include/sim4_ros2_delta")
-include_directories("include/sim4_ros2_delta/matlab/toolbox/coder/rtiostream/src")
-include_directories("include/sim4_ros2_delta/matlab/toolbox/coder/xcp/src/target/ext_mode/include")
-include_directories("include/sim4_ros2_delta/matlab/toolbox/coder/xcp/src/target/ext_mode/src")
-include_directories("include/sim4_ros2_delta/matlab/toolbox/coder/xcp/src/target/server/common")
-include_directories("include/sim4_ros2_delta/matlab/toolbox/coder/xcp/src/target/server/include")
-include_directories("include/sim4_ros2_delta/matlab/toolbox/coder/xcp/src/target/server/platform/default")
-include_directories("include/sim4_ros2_delta/matlab/toolbox/coder/xcp/src/target/server/platform/include")
-include_directories("include/sim4_ros2_delta/matlab/toolbox/coder/xcp/src/target/server/protocol/include")
-include_directories("include/sim4_ros2_delta/matlab/toolbox/coder/xcp/src/target/server/protocol/src")
-include_directories("include/sim4_ros2_delta/matlab/toolbox/coder/xcp/src/target/server/transport/include")
-include_directories("include/sim4_ros2_delta/matlab/toolbox/coder/xcp/src/target/server/transport/src")
 set (CMAKE_SKIP_BUILD_RPATH false)
 set (CMAKE_BUILD_WITH_INSTALL_RPATH true)
 set (CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
 set (CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 # Node
 add_executable(sim4_ROS2_delta 
-src/rtiostream_tcpip.c
-src/xcp_ext_classic_trigger.c
-src/xcp_ext_common.c
-src/xcp_ext_mode.c
-src/xcp_ext_param_default_tcp.c
-src/xcp_utils.c
-src/xcp_drv_rtiostream.c
-src/xcp_mem_default.c
-src/xcp_platform_default.c
-src/xcp.c
-src/xcp_calibration.c
-src/xcp_daq.c
-src/xcp_standard.c
-src/xcp_fifo.c
-src/xcp_frame_tcp.c
-src/xcp_transport.c
 src/slros2_multi_threaded_executor.cpp
 src/main.cpp
 src/ros2nodeinterface.cpp
@@ -92,50 +64,24 @@ target_compile_options(sim4_ROS2_delta PRIVATE
   -DNCSTATES=0
   -DHAVESTDIO
   -DMODEL_HAS_DYNAMICALLY_LOADED_SFCNS=0
-  -DXCP_DAQ_SUPPORT
-  -DXCP_CALIBRATION_SUPPORT
-  -DXCP_TIMESTAMP_SUPPORT
-  -DXCP_TIMESTAMP_BASED_ON_SIMULATION_TIME
-  -DXCP_SET_MTA_SUPPORT
-  -DEXTMODE_XCP_TRIGGER_SUPPORT
-  -DINTERNAL_XCP_MEM_BLOCK_1_SIZE=128
-  -DINTERNAL_XCP_MEM_BLOCK_1_NUMBER=1
-  -DINTERNAL_XCP_MEM_BLOCK_2_SIZE=168
-  -DINTERNAL_XCP_MEM_BLOCK_2_NUMBER=4
-  -DINTERNAL_XCP_MEM_BLOCK_3_SIZE=96
-  -DINTERNAL_XCP_MEM_BLOCK_3_NUMBER=4
-  -DINTERNAL_XCP_MEM_RESERVED_POOLS_TOTAL_SIZE=1000670
-  -DINTERNAL_XCP_MEM_RESERVED_POOLS_NUMBER=5
-  -DXCP_MEM_DAQ_RESERVED_POOL_BLOCKS_NUMBER=3
-  -DXCP_MEM_DAQ_RESERVED_POOLS_NUMBER=1
-  -DXCP_MIN_EVENT_NO_RESERVED_POOL=1
-  -DXCP_MAX_CTO_SIZE=255
-  -DXCP_MAX_DTO_SIZE=65532
-  -DXCP_MAX_ODT_ENTRY_SIZE=255
-  -DEXTMODE_STATIC
-  -DEXTMODE_STATIC_SIZE=1000000
-  -DON_TARGET_WAIT_FOR_START=1
   -DCLASSIC_INTERFACE=0
   -DALLOCATIONFCN=0
   -DTID01EQ=0
   -DTERMFCN=1
   -DONESTEPFCN=1
   -DMAT_FILE=0
-  -DMULTI_INSTANCE_CODE=0
-  -DEXT_MODE=1
+  -DMULTI_INSTANCE_CODE=1
   -DINTEGER_CODE=0
   -DMT=0
   -DROS2_PROJECT
   -DSTACK_SIZE=64
   -D__MW_TARGET_USE_HARDWARE_RESOURCES_H__
-  -D__linux__
   -DRT=RT
   -fpermissive  >
   )
 ament_target_dependencies(
   sim4_ROS2_delta
   "custom_messages"
-  "geometry_msgs"
   "rclcpp"
 )
 target_include_directories(sim4_ROS2_delta PUBLIC
@@ -165,4 +111,4 @@ add_custom_command(
 				   )				   
 endforeach(file_i)
 ament_package()
-# Generated on Thu Jul 02 13:42:11 2026
+# Generated on Sat Aug 22 08:21:16 2026

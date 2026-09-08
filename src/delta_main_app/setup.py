@@ -14,6 +14,7 @@ setup(
             'launch/delta_main.launch.py',
             'launch/blind_pick_place.launch.py',
             'launch/matlab_bridge.launch.py',
+            'launch/weed_pick_place.launch.py',
         ]),
     ],
     install_requires=['setuptools'],
@@ -33,6 +34,10 @@ setup(
             'repeatability_test        = delta_main_app.repeatability_test:main',
             'workspace_accuracy_sweep  = delta_main_app.workspace_accuracy_sweep:main',
             'matlab_bridge            = delta_main_app.matlab_bridge_node:main',
+            'test1                    = delta_main_app.test1:main',
+            'check_cube_detection_accuracy = delta_main_app.check_cube_detection_accuracy:main',
+            'camera_detection_monitor      = delta_main_app.camera_detection_monitor:main',
+            'dynamic_tracking_log          = delta_main_app.dynamic_tracking_log:main',
         ],
     },
 )

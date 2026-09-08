@@ -4,9 +4,9 @@
 //
 // Code generated for Simulink model 'sim4_ROS2_delta'.
 //
-// Model version                  : 1.230
+// Model version                  : 1.367
 // Simulink Coder version         : 25.2 (R2025b) 28-Jul-2025
-// C/C++ source code generated on : Thu Jul 02 13:41:51 2026
+// C/C++ source code generated on : Sat Aug 22 08:21:06 2026
 //
 #ifdef _MSC_VER
 #pragma warning(push)
@@ -14,7 +14,6 @@
 #pragma warning(disable : 4265)
 #pragma warning(disable : 4458)
 #pragma warning(disable : 4100)
-#pragma comment(lib, "Ws2_32.lib")
 #else
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wpedantic"
@@ -35,9 +34,9 @@
 #undef ROS_SET_RTM_ERROR_STATUS
 #undef ROS_GET_RTM_ERROR_STATUS
 #undef ROS_RTM_STEP_TASK
-#define ROS_SET_RTM_ERROR_STATUS(status)  rtmSetErrorStatus(sim4_ROS2_delta_M,(status));
-#define ROS_GET_RTM_ERROR_STATUS()        rtmGetErrorStatus(sim4_ROS2_delta_M)
-#define ROS_RTM_STEP_TASK(id)             rtmStepTask(sim4_ROS2_delta_M,id)
+#define ROS_SET_RTM_ERROR_STATUS(status) mModel->getRTM()->setErrorStatus(status)
+#define ROS_GET_RTM_ERROR_STATUS()       mModel->getRTM()->getErrorStatus()
+#define ROS_RTM_STEP_TASK(id)            mModel->getRTM()->StepTask(id)
 #include "slros2_multi_threaded_executor.h"
 std::vector<rclcpp::SubscriptionBase*> SLROSSubscribers;
 extern rclcpp::Node::SharedPtr SLROSNodePtr;
@@ -48,11 +47,11 @@ const char *RT_MEMORY_ALLOCATION_ERROR = "memory allocation error";
 namespace ros2 {
 namespace matlab {
 NodeInterface::NodeInterface()
-    : mExec()
+    : mModel()
+    , mExec()
     , mBaseRateSem()
     , mBaseRateThread()
     , mSchedulerTimer()
-    , mExtModeThread()
     , mStopSem()
     , mRunModel(true){
   }
@@ -70,38 +69,20 @@ void NodeInterface::initialize(int argc, char * const argv[]) {
         RCLCPP_INFO(SLROSNodePtr->get_logger(),"** Starting the model \"sim4_ROS2_delta\" **\n");
         mExec = std::make_shared<rclcpp::executors::SLMultiThreadedExecutor>();
         mExec->add_node(SLROSNodePtr);
-        {
-			char* extmodeArg[] = {"sim4_ROS2_delta","-port","17725","-verbose","0","-w"};
-            errorCode = extmodeParseArgs(6, (const char_T **)extmodeArg);
-            if (errorCode != EXTMODE_SUCCESS) {
-                RCLCPP_ERROR(SLROSNodePtr->get_logger(),"!!! Error while parsing ExtModeArgs. Error code: %d",errorCode);
-            }
-		}
         //initialize the model which will initialize the publishers and subscribers
-        ROS_SET_RTM_ERROR_STATUS((NULL));
-        sim4_ROS2_delta_initialize();
-		/* External mode */
-        errorCode = extmodeInit(sim4_ROS2_delta_M->extModeInfo, &rtmGetTFinal(sim4_ROS2_delta_M));
-        if (errorCode != EXTMODE_SUCCESS) {
-            RCLCPP_ERROR(SLROSNodePtr->get_logger(),"!!! Extmode Init failed. Error code: %d",errorCode);
-        }
-        if (errorCode == EXTMODE_SUCCESS) {
-            // Wait until a Start or Stop Request has been received from the Host
-            extmodeWaitForHostRequest(EXTMODE_WAIT_FOREVER);
-            if (extmodeStopRequested()) {
-                rtmSetStopRequested(sim4_ROS2_delta_M, true);
-            }
-        }
-		mExtModeThread = std::make_shared<std::thread>(&NodeInterface::extmodeBackgroundTask, this);
+        mModel = std::make_shared<sim4_ROS2_delta>(
+        );
+        ROS_SET_RTM_ERROR_STATUS(NULL);
+        mModel->initialize();
         //create the threads for the rates in the Model
         mBaseRateThread = std::make_shared<std::thread>(&NodeInterface::baseRateTask, this);
         // Create "MutuallyExclusive" callback group for callback associated with mSchedulerTimer to prevent
         // it from being executed in parallel.
 		mSchedulerGroup = SLROSNodePtr->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-		mSchedulerTimer = SLROSNodePtr->create_wall_timer(std::chrono::nanoseconds(200000000),std::bind(&NodeInterface::schedulerThreadCallback,this),mSchedulerGroup);
+		mSchedulerTimer = SLROSNodePtr->create_wall_timer(std::chrono::nanoseconds(10000000),std::bind(&NodeInterface::schedulerThreadCallback,this),mSchedulerGroup);
 		for(size_t ctr = 0; ctr<SLROSSubscribers.size();ctr++){
            mExec->stopSubscriberCallback(SLROSSubscribers[ctr]);
-        }
+       }
     }
     catch (std::exception& ex) {
         std::cout << ex.what() << std::endl;
@@ -121,10 +102,11 @@ int NodeInterface::run() {
 }
 boolean_T NodeInterface::getStopRequestedFlag(void) {
     #ifndef rtmGetStopRequested
-    return (!(ROS_GET_RTM_ERROR_STATUS() == (NULL)));
+    return (!(ROS_GET_RTM_ERROR_STATUS()
+        == (NULL)));
     #else
     return (!(ROS_GET_RTM_ERROR_STATUS()
-        == (NULL)) || rtmGetStopRequested(sim4_ROS2_delta_M));
+        == (NULL)) || rtmGetStopRequested(mModel->getRTM()));
     #endif
 }
 void NodeInterface::stop(void) {
@@ -139,26 +121,28 @@ void NodeInterface::stop(void) {
 void NodeInterface::terminate(void) {
     if (mBaseRateThread.get()) {
         mRunModel = false;
-        mBaseRateSem.notify();
+        mBaseRateSem.notify(); // break out wait
         mBaseRateThread->join();
-		if (mSchedulerTimer.get()) {
-        	mSchedulerTimer->cancel();
-        	mSchedulerTimer->reset();
-		}
+        if (mSchedulerTimer.get()) {
+	        mSchedulerTimer->cancel();
+    	    mSchedulerTimer->reset();
+        }
         mBaseRateThread.reset();
-        sim4_ROS2_delta_terminate();
-          extmodeReset();
+        if (mModel.get()) {
+            mModel->terminate();
+        }
+        mModel.reset();
         mExec.reset();
         SLROSNodePtr.reset();
         rclcpp::shutdown();
     }
 }
 //
-// Scheduler Task using clock timer to run base-rate
+// Scheduler Task using wall clock timer to run base-rate
 //
 void NodeInterface::schedulerThreadCallback(void)
 {
-	if(mRunModel) {
+  if(mRunModel) {
         mBaseRateSem.notify();
     }
 }
@@ -174,32 +158,10 @@ void NodeInterface::baseRateTask(void) {
     RCLCPP_INFO(SLROSNodePtr->get_logger(),"** Base rate task semaphore received\n");
 #endif
     if (!mRunModel) break;
-	/* External mode */
-    extmodeSimulationTime_T currentTime = (extmodeSimulationTime_T) (sim4_ROS2_delta_M)->Timing.taskTime0;
-    {
-        boolean_T rtmStopReq = false;
-        rtmStopReq = !((rtmGetErrorStatus(sim4_ROS2_delta_M) == (NULL)));
-        mRunModel = !rtmStopReq && !extmodeSimulationComplete() && !extmodeStopRequested();
-        if (mRunModel == false) {
-            rtmSetErrorStatus(sim4_ROS2_delta_M, "Simulation finished");
-            break;
-        }
-    }
-    sim4_ROS2_delta_step(
-	);
-    extmodeEvent(0, currentTime);
-    mRunModel = !NodeInterface::getStopRequestedFlag();
+    mModel->step();
+    mRunModel &= !NodeInterface::getStopRequestedFlag(); //If RunModel and not stop requested
   }
   NodeInterface::stop();
-}
-void NodeInterface::extmodeBackgroundTask(void)
-{
-  while (mRunModel) {
-    /* External mode */
-    extmodeBackgroundRun();
-    // Sleep for 10 ms to yield to other threads
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
 }
 }//namespace matlab
 }//namespace ros2

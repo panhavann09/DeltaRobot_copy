@@ -28,5 +28,5 @@
   #define SIM4_ROS2_DELTA_PUBLIC_TYPE
 #endif
 #endif  // SIM4_ROS2_DELTA__VISIBILITY_CONTROL_H_
-// Generated 02-Jul-2026 13:42:11
+// Generated 22-Aug-2026 08:21:16
  

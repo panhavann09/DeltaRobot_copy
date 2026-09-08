@@ -33,7 +33,7 @@ from delta_common import config
 
 # ── Hardware constants ────────────────────────────────────────────────────────
 
-CAN_PORT    = "can0"
+CAN_PORT    = "can1"
 MOTOR_IDS   = [1, 2, 3]
 MOTOR_NAMES = [f"motor_{i}" for i in MOTOR_IDS]
 THETA_MIN   = config.THETA1_MIN   # degrees  (shared for all three arms)

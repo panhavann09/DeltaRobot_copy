@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>delta_weed_bridge</name>
+  <version>0.0.0</version>
+  <description>Bridges plant_perception's weed/crop detections to the existing DeltaRobot pick-and-place interface (/delta/target_xyz etc.)</description>
+
+  <maintainer email="s4mb4th@todo.todo">s4mb4th</maintainer>
+  <license>Apache License 2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>python3</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>delta_common</exec_depend>
+  <exec_depend>plant_perception</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

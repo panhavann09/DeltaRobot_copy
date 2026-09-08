@@ -7,22 +7,21 @@
 //
 // Code generated for Simulink model 'sim4_ROS2_delta'.
 //
-// Model version                  : 1.230
+// Model version                  : 1.367
 // Simulink Coder version         : 25.2 (R2025b) 28-Jul-2025
-// C/C++ source code generated on : Thu Jul  2 13:41:44 2026
+// C/C++ source code generated on : Sat Aug 22 08:20:52 2026
 //
 // Target selection: ert.tlc
-// Embedded hardware selection: AMD->x86-64 (Windows64)
+// Embedded hardware selection: ARM Compatible->ARM Cortex-A (64-bit)
 // Code generation objectives: Unspecified
 // Validation result: Not run
 //
 #include "sim4_ROS2_delta.h"
-#include "rtwtypes.h"
 #include "sim4_ROS2_delta_types.h"
-#include <emmintrin.h>
 #include <string.h>
 #include <math.h>
 #include "sim4_ROS2_delta_private.h"
+#include "rtwtypes.h"
 #include "rmw/qos_profiles.h"
 #include <stddef.h>
 
@@ -35,25 +34,28 @@ extern "C"
 
 #include "rt_defines.h"
 
-// Block signals (default storage)
-B_sim4_ROS2_delta_T sim4_ROS2_delta_B;
+real_T rt_hypotd_snf(real_T u0, real_T u1)
+{
+  real_T a;
+  real_T b;
+  real_T y;
+  a = fabs(u0);
+  b = fabs(u1);
+  if (a < b) {
+    a /= b;
+    y = sqrt(a * a + 1.0) * b;
+  } else if (a > b) {
+    b /= a;
+    y = sqrt(b * b + 1.0) * a;
+  } else if (rtIsNaN(b)) {
+    y = (rtNaN);
+  } else {
+    y = a * 1.4142135623730951;
+  }
 
-// Block states (default storage)
-DW_sim4_ROS2_delta_T sim4_ROS2_delta_DW;
+  return y;
+}
 
-// Real-time model
-RT_MODEL_sim4_ROS2_delta_T sim4_ROS2_delta_M_ = RT_MODEL_sim4_ROS2_delta_T();
-RT_MODEL_sim4_ROS2_delta_T *const sim4_ROS2_delta_M = &sim4_ROS2_delta_M_;
-
-// Forward declaration for local functions
-static void sim4_ROS2_delta_angleYZ(real_T x0, real_T b_y0, real_T z0, real_T e,
-  real_T f, real_T re, real_T rf, real_T *status, real_T *theta);
-static void sim4_ROS2__Subscriber_setupImpl(const
-  ros_slros2_internal_block_Sub_T *obj);
-static void sim4_ROS_Subscriber_setupImpl_m(const
-  ros_slros2_internal_block_Sub_T *obj);
-static void sim4_ROS2_d_Publisher_setupImpl(const
-  ros_slros2_internal_block_Pub_T *obj);
 real_T rt_atan2d_snf(real_T u0, real_T u1)
 {
   real_T y;
@@ -90,38 +92,7 @@ real_T rt_atan2d_snf(real_T u0, real_T u1)
   return y;
 }
 
-// Function for MATLAB Function: '<Root>/MATLAB Function3'
-static void sim4_ROS2_delta_angleYZ(real_T x0, real_T b_y0, real_T z0, real_T e,
-  real_T f, real_T re, real_T rf, real_T *status, real_T *theta)
-{
-  real_T a;
-  real_T b;
-  real_T d;
-  real_T yj;
-  sim4_ROS2_delta_B.b_y1 = -0.28867513459481292 * f;
-  b_y0 -= 0.28867513459481292 * e;
-  a = (((((x0 * x0 + b_y0 * b_y0) + z0 * z0) + rf * rf) - re * re) -
-       sim4_ROS2_delta_B.b_y1 * sim4_ROS2_delta_B.b_y1) / (2.0 * z0);
-  b = (sim4_ROS2_delta_B.b_y1 - b_y0) / z0;
-  d = b * sim4_ROS2_delta_B.b_y1 + a;
-  yj = b * b;
-  d = (yj * rf + rf) * rf - d * d;
-  if (d < 0.0) {
-    *status = -1.0;
-    *theta = 0.0;
-  } else {
-    yj = ((sim4_ROS2_delta_B.b_y1 - a * b) - sqrt(d)) / (yj + 1.0);
-    *theta = rt_atan2d_snf(-(b * yj + a), sim4_ROS2_delta_B.b_y1 - yj) *
-      57.295779513082323;
-    if (yj > sim4_ROS2_delta_B.b_y1) {
-      *theta += 180.0;
-    }
-
-    *status = 0.0;
-  }
-}
-
-static void sim4_ROS2__Subscriber_setupImpl(const
+void sim4_ROS2_delta::sim4_ROS2__Subscriber_setupImpl(const
   ros_slros2_internal_block_Sub_T *obj)
 {
   rmw_qos_profile_t qos_profile;
@@ -145,45 +116,14 @@ static void sim4_ROS2__Subscriber_setupImpl(const
                  (bool)obj->QOSAvoidROSNamespaceConventions);
   for (int32_T i = 0; i < 25; i++) {
     // Start for MATLABSystem: '<S5>/SourceBlock'
-    sim4_ROS2_delta_B.b_zeroDelimTopic_k[i] = b_zeroDelimTopic[i];
-  }
-
-  Sub_sim4_ROS2_delta_75.createSubscriber(&sim4_ROS2_delta_B.b_zeroDelimTopic_k
-    [0], qos_profile);
-}
-
-static void sim4_ROS_Subscriber_setupImpl_m(const
-  ros_slros2_internal_block_Sub_T *obj)
-{
-  rmw_qos_profile_t qos_profile;
-  sJ4ih70VmKcvCeguWN0mNVF deadline;
-  sJ4ih70VmKcvCeguWN0mNVF lifespan;
-  sJ4ih70VmKcvCeguWN0mNVF liveliness_lease_duration;
-  static const char_T b_zeroDelimTopic[22] = "/delta/ee_position_mm";
-  qos_profile = rmw_qos_profile_default;
-
-  // Start for MATLABSystem: '<S6>/SourceBlock'
-  deadline.sec = 0.0;
-  deadline.nsec = 0.0;
-  lifespan.sec = 0.0;
-  lifespan.nsec = 0.0;
-  liveliness_lease_duration.sec = 0.0;
-  liveliness_lease_duration.nsec = 0.0;
-  SET_QOS_VALUES(qos_profile, RMW_QOS_POLICY_HISTORY_KEEP_LAST, (size_t)10.0,
-                 RMW_QOS_POLICY_DURABILITY_VOLATILE,
-                 RMW_QOS_POLICY_RELIABILITY_RELIABLE, deadline, lifespan,
-                 RMW_QOS_POLICY_LIVELINESS_AUTOMATIC, liveliness_lease_duration,
-                 (bool)obj->QOSAvoidROSNamespaceConventions);
-  for (int32_T i = 0; i < 22; i++) {
-    // Start for MATLABSystem: '<S6>/SourceBlock'
     sim4_ROS2_delta_B.b_zeroDelimTopic_c[i] = b_zeroDelimTopic[i];
   }
 
-  Sub_sim4_ROS2_delta_76.createSubscriber(&sim4_ROS2_delta_B.b_zeroDelimTopic_c
+  Sub_sim4_ROS2_delta_75.createSubscriber(&sim4_ROS2_delta_B.b_zeroDelimTopic_c
     [0], qos_profile);
 }
 
-static void sim4_ROS2_d_Publisher_setupImpl(const
+void sim4_ROS2_delta::sim4_ROS2_d_Publisher_setupImpl(const
   ros_slros2_internal_block_Pub_T *obj)
 {
   rmw_qos_profile_t qos_profile;
@@ -200,7 +140,7 @@ static void sim4_ROS2_d_Publisher_setupImpl(const
   lifespan.nsec = 0.0;
   liveliness_lease_duration.sec = 0.0;
   liveliness_lease_duration.nsec = 0.0;
-  SET_QOS_VALUES(qos_profile, RMW_QOS_POLICY_HISTORY_KEEP_LAST, (size_t)10.0,
+  SET_QOS_VALUES(qos_profile, RMW_QOS_POLICY_HISTORY_KEEP_LAST, (size_t)1.0,
                  RMW_QOS_POLICY_DURABILITY_VOLATILE,
                  RMW_QOS_POLICY_RELIABILITY_RELIABLE, deadline, lifespan,
                  RMW_QOS_POLICY_LIVELINESS_AUTOMATIC, liveliness_lease_duration,
@@ -215,197 +155,181 @@ static void sim4_ROS2_d_Publisher_setupImpl(const
 }
 
 // Model step function
-void sim4_ROS2_delta_step(void)
+void sim4_ROS2_delta::step()
 {
-  __m128d tmp;
+  real_T e1_idx_0_tmp;
+  real_T mx;
+  real_T rtb_Sum3_idx_0;
+  real_T rtb_Sum3_idx_1;
+  real_T rtb_Sum3_idx_2;
+  int32_T i;
   boolean_T b_varargout_1;
+  static const int16_T f[3] = { 180, 300, 60 };
 
-  // Reset subsysRan breadcrumbs
-  srClearBC(sim4_ROS2_delta_DW.EnabledSubsystem_SubsysRanBC_a);
+  int32_T exitg1;
+  boolean_T exitg2;
 
-  // Reset subsysRan breadcrumbs
-  srClearBC(sim4_ROS2_delta_DW.EnabledSubsystem_SubsysRanBC);
+  // BusAssignment: '<Root>/Bus Assignment1'
+  memset(&sim4_ROS2_delta_B.BusAssignment1, 0, sizeof
+         (SL_Bus_custom_messages_DeltaJointAngles));
 
   // MATLABSystem: '<S5>/SourceBlock'
   b_varargout_1 = Sub_sim4_ROS2_delta_75.getLatestMessage
     (&sim4_ROS2_delta_B.rtb_SourceBlock_o2_m);
 
   // Outputs for Enabled SubSystem: '<S5>/Enabled Subsystem' incorporates:
-  //   EnablePort: '<S7>/Enable'
+  //   EnablePort: '<S6>/Enable'
 
   // Start for MATLABSystem: '<S5>/SourceBlock'
   if (b_varargout_1) {
-    // SignalConversion generated from: '<S7>/In1'
+    // SignalConversion generated from: '<S6>/In1'
     sim4_ROS2_delta_B.In1 = sim4_ROS2_delta_B.rtb_SourceBlock_o2_m;
-    srUpdateBC(sim4_ROS2_delta_DW.EnabledSubsystem_SubsysRanBC_a);
   }
 
   // End of Start for MATLABSystem: '<S5>/SourceBlock'
   // End of Outputs for SubSystem: '<S5>/Enabled Subsystem'
 
-  // SignalConversion generated from: '<Root>/Bus Selector2'
-  sim4_ROS2_delta_B.x_mm = sim4_ROS2_delta_B.In1.x_mm;
+  // MATLAB Function: '<Root>/MATLAB Function1' incorporates:
+  //   SignalConversion generated from: '<Root>/Bus Selector2'
 
-  // SignalConversion generated from: '<Root>/Bus Selector2'
-  sim4_ROS2_delta_B.y_mm = sim4_ROS2_delta_B.In1.y_mm;
-
-  // SignalConversion generated from: '<Root>/Bus Selector2'
-  sim4_ROS2_delta_B.z_mm = sim4_ROS2_delta_B.In1.z_mm;
-
-  // MATLAB Function: '<Root>/MATLAB Function1'
-  sim4_ROS2_delta_B.x_pred = sim4_ROS2_delta_B.x_mm;
-  sim4_ROS2_delta_B.z_pred = sim4_ROS2_delta_B.z_mm;
-  sim4_ROS2_delta_B.y_pred = sim4_ROS2_delta_B.y_mm + 13.0;
-
-  // SignalConversion generated from: '<Root>/Mux2'
-  sim4_ROS2_delta_B.TmpSignalConversionAtTAQSigLogg[0] =
-    sim4_ROS2_delta_B.x_pred;
-  sim4_ROS2_delta_B.TmpSignalConversionAtTAQSigLogg[1] =
-    sim4_ROS2_delta_B.y_pred;
-  sim4_ROS2_delta_B.TmpSignalConversionAtTAQSigLogg[2] =
-    sim4_ROS2_delta_B.z_pred;
-
-  // MATLABSystem: '<S6>/SourceBlock'
-  b_varargout_1 = Sub_sim4_ROS2_delta_76.getLatestMessage
-    (&sim4_ROS2_delta_B.rtb_SourceBlock_o2_n_c);
-
-  // Outputs for Enabled SubSystem: '<S6>/Enabled Subsystem' incorporates:
-  //   EnablePort: '<S8>/Enable'
-
-  // Start for MATLABSystem: '<S6>/SourceBlock'
-  if (b_varargout_1) {
-    // SignalConversion generated from: '<S8>/In1'
-    sim4_ROS2_delta_B.In1_i = sim4_ROS2_delta_B.rtb_SourceBlock_o2_n_c;
-    srUpdateBC(sim4_ROS2_delta_DW.EnabledSubsystem_SubsysRanBC);
+  if (sim4_ROS2_delta_B.In1.x_mm >= 0.0) {
+    // Sum: '<Root>/Sum3'
+    rtb_Sum3_idx_0 = sim4_ROS2_delta_B.In1.x_mm * 1.8;
+  } else {
+    // Sum: '<Root>/Sum3'
+    rtb_Sum3_idx_0 = sim4_ROS2_delta_B.In1.x_mm * 0.5;
   }
 
-  // End of Start for MATLABSystem: '<S6>/SourceBlock'
-  // End of Outputs for SubSystem: '<S6>/Enabled Subsystem'
-
-  // SignalConversion generated from: '<Root>/Bus Selector3'
-  sim4_ROS2_delta_B.x = sim4_ROS2_delta_B.In1_i.point.x;
-
-  // SignalConversion generated from: '<Root>/Bus Selector3'
-  sim4_ROS2_delta_B.y = sim4_ROS2_delta_B.In1_i.point.y;
-
-  // SignalConversion generated from: '<Root>/Bus Selector3'
-  sim4_ROS2_delta_B.z = sim4_ROS2_delta_B.In1_i.point.z;
-
-  // Sum: '<Root>/Sum2'
-  tmp = _mm_set_pd(sim4_ROS2_delta_B.y, sim4_ROS2_delta_B.x);
-  tmp = _mm_add_pd(_mm_sub_pd(_mm_loadu_pd
-    (&sim4_ROS2_delta_B.TmpSignalConversionAtTAQSigLogg[0]), tmp), tmp);
+  // End of MATLAB Function: '<Root>/MATLAB Function1'
 
   // Sum: '<Root>/Sum3' incorporates:
-  //   Sum: '<Root>/Sum2'
+  //   SignalConversion generated from: '<Root>/Bus Selector2'
+  //
+  rtb_Sum3_idx_1 = sim4_ROS2_delta_B.In1.y_mm;
+  rtb_Sum3_idx_2 = sim4_ROS2_delta_B.In1.z_mm;
 
-  _mm_storeu_pd(&sim4_ROS2_delta_B.Sum3[0], tmp);
-  sim4_ROS2_delta_B.Sum3[2] =
-    (sim4_ROS2_delta_B.TmpSignalConversionAtTAQSigLogg[2] - sim4_ROS2_delta_B.z)
-    + sim4_ROS2_delta_B.z;
+  // BusAssignment: '<Root>/Bus Assignment1' incorporates:
+  //   MATLAB Function: '<Root>/MATLAB Function4'
 
-  // MATLAB Function: '<Root>/MATLAB Function3'
-  sim4_ROS2_delta_B.theta1 = 0.0;
-  sim4_ROS2_delta_B.theta2 = 0.0;
-  sim4_ROS2_delta_B.theta3 = 0.0;
-  sim4_ROS2_delta_B.ik_valid = false;
+  sim4_ROS2_delta_B.BusAssignment1.theta1_deg = 0.0;
+  sim4_ROS2_delta_B.BusAssignment1.theta2_deg = 0.0;
+  sim4_ROS2_delta_B.BusAssignment1.theta3_deg = 0.0;
+  sim4_ROS2_delta_B.BusAssignment1.ik_valid = false;
 
-  // BusAssignment: '<Root>/Bus Assignment1'
-  memset(&sim4_ROS2_delta_B.BusAssignment1, 0, sizeof
-         (SL_Bus_custom_messages_DeltaJointAngles));
+  // MATLAB Function: '<Root>/MATLAB Function4' incorporates:
+  //   SignalConversion generated from: '<Root>/Bus Selector2'
+  //
+  if ((!(fabs(rtb_Sum3_idx_0) > 220.0)) && (!(fabs(sim4_ROS2_delta_B.In1.y_mm) >
+        220.0)) && ((!(sim4_ROS2_delta_B.In1.z_mm < -700.0)) &&
+                    (!(sim4_ROS2_delta_B.In1.z_mm > -228.0)))) {
+    sim4_ROS2_delta_B.thetas[0] = 0.0;
+    sim4_ROS2_delta_B.thetas[1] = 0.0;
+    sim4_ROS2_delta_B.thetas[2] = 0.0;
+    i = 0;
+    do {
+      exitg1 = 0;
+      if (i < 3) {
+        sim4_ROS2_delta_B.s = 0.017453292519943295 * static_cast<real_T>(f[i]);
+        sim4_ROS2_delta_B.c = cos(sim4_ROS2_delta_B.s);
+        sim4_ROS2_delta_B.s = sin(sim4_ROS2_delta_B.s);
+        sim4_ROS2_delta_B.lp2 = -rtb_Sum3_idx_0 * sim4_ROS2_delta_B.s +
+          rtb_Sum3_idx_1 * sim4_ROS2_delta_B.c;
+        sim4_ROS2_delta_B.lp2 = 160000.0 - sim4_ROS2_delta_B.lp2 *
+          sim4_ROS2_delta_B.lp2;
+        if (sim4_ROS2_delta_B.lp2 < 0.0) {
+          exitg1 = 1;
+        } else {
+          sim4_ROS2_delta_B.lp2 = sqrt(sim4_ROS2_delta_B.lp2);
+          sim4_ROS2_delta_B.s = ((rtb_Sum3_idx_0 * sim4_ROS2_delta_B.c +
+            rtb_Sum3_idx_1 * sim4_ROS2_delta_B.s) + 35.0) - 163.21;
+          sim4_ROS2_delta_B.d = rt_hypotd_snf(sim4_ROS2_delta_B.s,
+            rtb_Sum3_idx_2);
+          if (sim4_ROS2_delta_B.d > sim4_ROS2_delta_B.lp2 + 200.0) {
+            exitg1 = 1;
+          } else {
+            sim4_ROS2_delta_B.lp2 = ((40000.0 - sim4_ROS2_delta_B.lp2 *
+              sim4_ROS2_delta_B.lp2) + sim4_ROS2_delta_B.d * sim4_ROS2_delta_B.d)
+              / (2.0 * sim4_ROS2_delta_B.d);
+            sim4_ROS2_delta_B.c = 40000.0 - sim4_ROS2_delta_B.lp2 *
+              sim4_ROS2_delta_B.lp2;
+            if (sim4_ROS2_delta_B.c < 0.0) {
+              exitg1 = 1;
+            } else {
+              sim4_ROS2_delta_B.c = sqrt(sim4_ROS2_delta_B.c);
+              sim4_ROS2_delta_B.s /= sim4_ROS2_delta_B.d;
+              sim4_ROS2_delta_B.d = rtb_Sum3_idx_2 / sim4_ROS2_delta_B.d;
+              mx = sim4_ROS2_delta_B.lp2 * sim4_ROS2_delta_B.s + 163.21;
+              sim4_ROS2_delta_B.lp2 *= sim4_ROS2_delta_B.d;
+              e1_idx_0_tmp = sim4_ROS2_delta_B.c * -sim4_ROS2_delta_B.d;
+              sim4_ROS2_delta_B.d = e1_idx_0_tmp + mx;
+              mx -= e1_idx_0_tmp;
+              sim4_ROS2_delta_B.c *= sim4_ROS2_delta_B.s;
+              sim4_ROS2_delta_B.s = sim4_ROS2_delta_B.lp2 - sim4_ROS2_delta_B.c;
+              if (sim4_ROS2_delta_B.d >= mx) {
+                mx = sim4_ROS2_delta_B.d;
+                sim4_ROS2_delta_B.s = sim4_ROS2_delta_B.c +
+                  sim4_ROS2_delta_B.lp2;
+              }
 
-  // MATLAB Function: '<Root>/MATLAB Function3'
-  if ((!(fabs(sim4_ROS2_delta_B.Sum3[0]) > 250.0)) && (!(fabs
-        (sim4_ROS2_delta_B.Sum3[1]) > 250.0)) && ((!(sim4_ROS2_delta_B.Sum3[2] <
-         -670.0)) && (!(sim4_ROS2_delta_B.Sum3[2] > -323.0)))) {
-    sim4_ROS2_delta_angleYZ(sim4_ROS2_delta_B.Sum3[0], sim4_ROS2_delta_B.Sum3[1],
-      sim4_ROS2_delta_B.Sum3[2], 35.0, 157.0, 400.0, 200.0,
-      &sim4_ROS2_delta_B.st1, &sim4_ROS2_delta_B.t1);
-    if (!(sim4_ROS2_delta_B.st1 != 0.0)) {
-      sim4_ROS2_delta_B.st1 = sim4_ROS2_delta_B.Sum3[0] * -0.5;
-      sim4_ROS2_delta_B.d = sim4_ROS2_delta_B.Sum3[1] * 0.8660254037844386;
-      sim4_ROS2_delta_B.d1 = sim4_ROS2_delta_B.Sum3[1] * -0.5;
-      sim4_ROS2_delta_B.d2 = sim4_ROS2_delta_B.Sum3[0] * 0.8660254037844386;
-      sim4_ROS2_delta_angleYZ(sim4_ROS2_delta_B.st1 + sim4_ROS2_delta_B.d,
-        sim4_ROS2_delta_B.d1 - sim4_ROS2_delta_B.d2, sim4_ROS2_delta_B.Sum3[2],
-        35.0, 157.0, 400.0, 200.0, &sim4_ROS2_delta_B.st2, &sim4_ROS2_delta_B.t2);
-      if (!(sim4_ROS2_delta_B.st2 != 0.0)) {
-        sim4_ROS2_delta_angleYZ(sim4_ROS2_delta_B.st1 - sim4_ROS2_delta_B.d,
-          sim4_ROS2_delta_B.d1 + sim4_ROS2_delta_B.d2, sim4_ROS2_delta_B.Sum3[2],
-          35.0, 157.0, 400.0, 200.0, &sim4_ROS2_delta_B.st2,
-          &sim4_ROS2_delta_B.t3);
-        if ((!(sim4_ROS2_delta_B.st2 != 0.0)) && (!(sim4_ROS2_delta_B.t1 < -5.0))
-            && (!(sim4_ROS2_delta_B.t1 > 90.0)) && (!(sim4_ROS2_delta_B.t2 <
-              -5.0)) && (!(sim4_ROS2_delta_B.t2 > 90.0)) &&
-            (!(sim4_ROS2_delta_B.t3 < -5.0)) && (!(sim4_ROS2_delta_B.t3 > 90.0)))
-        {
-          sim4_ROS2_delta_B.theta1 = sim4_ROS2_delta_B.t1;
-          sim4_ROS2_delta_B.theta2 = sim4_ROS2_delta_B.t2;
-          sim4_ROS2_delta_B.theta3 = sim4_ROS2_delta_B.t3;
-          sim4_ROS2_delta_B.ik_valid = true;
+              sim4_ROS2_delta_B.thetas[i] = rt_atan2d_snf(-sim4_ROS2_delta_B.s,
+                mx - 163.21) * 57.295779513082323;
+              i++;
+            }
+          }
         }
-      }
-    }
-  }
+      } else {
+        b_varargout_1 = false;
+        i = 0;
+        exitg2 = false;
+        while ((!exitg2) && (i < 3)) {
+          if (sim4_ROS2_delta_B.thetas[i] < -5.0) {
+            b_varargout_1 = true;
+            exitg2 = true;
+          } else {
+            i++;
+          }
+        }
 
-  // BusAssignment: '<Root>/Bus Assignment1'
-  sim4_ROS2_delta_B.BusAssignment1.theta1_deg = sim4_ROS2_delta_B.theta1;
-  sim4_ROS2_delta_B.BusAssignment1.theta2_deg = sim4_ROS2_delta_B.theta2;
-  sim4_ROS2_delta_B.BusAssignment1.theta3_deg = sim4_ROS2_delta_B.theta3;
-  sim4_ROS2_delta_B.BusAssignment1.ik_valid = sim4_ROS2_delta_B.ik_valid;
+        if (!b_varargout_1) {
+          b_varargout_1 = false;
+          i = 0;
+          exitg2 = false;
+          while ((!exitg2) && (i < 3)) {
+            if (sim4_ROS2_delta_B.thetas[i] > 90.0) {
+              b_varargout_1 = true;
+              exitg2 = true;
+            } else {
+              i++;
+            }
+          }
+
+          if (!b_varargout_1) {
+            sim4_ROS2_delta_B.BusAssignment1.theta1_deg =
+              sim4_ROS2_delta_B.thetas[0];
+            sim4_ROS2_delta_B.BusAssignment1.theta2_deg =
+              sim4_ROS2_delta_B.thetas[1];
+            sim4_ROS2_delta_B.BusAssignment1.theta3_deg =
+              sim4_ROS2_delta_B.thetas[2];
+            sim4_ROS2_delta_B.BusAssignment1.ik_valid = true;
+          }
+        }
+
+        exitg1 = 1;
+      }
+    } while (exitg1 == 0);
+  }
 
   // MATLABSystem: '<S4>/SinkBlock'
   Pub_sim4_ROS2_delta_72.publish(&sim4_ROS2_delta_B.BusAssignment1);
-
-  // Update absolute time for base rate
-  // The "clockTick0" counts the number of times the code of this task has
-  //  been executed. The absolute time is the multiplication of "clockTick0"
-  //  and "Timing.stepSize0". Size of "clockTick0" ensures timer will not
-  //  overflow during the application lifespan selected.
-
-  sim4_ROS2_delta_M->Timing.taskTime0 =
-    ((time_T)(++sim4_ROS2_delta_M->Timing.clockTick0)) *
-    sim4_ROS2_delta_M->Timing.stepSize0;
 }
 
 // Model initialize function
-void sim4_ROS2_delta_initialize(void)
+void sim4_ROS2_delta::initialize()
 {
   // Registration code
 
   // initialize non-finites
   rt_InitInfAndNaN(sizeof(real_T));
-  rtmSetTFinal(sim4_ROS2_delta_M, -1);
-  sim4_ROS2_delta_M->Timing.stepSize0 = 0.2;
-
-  // External mode info
-  sim4_ROS2_delta_M->Sizes.checksums[0] = (1594700945U);
-  sim4_ROS2_delta_M->Sizes.checksums[1] = (621383653U);
-  sim4_ROS2_delta_M->Sizes.checksums[2] = (2893097899U);
-  sim4_ROS2_delta_M->Sizes.checksums[3] = (958291256U);
-
-  {
-    static const sysRanDType rtAlwaysEnabled = SUBSYS_RAN_BC_ENABLE;
-    static RTWExtModeInfo rt_ExtModeInfo;
-    static const sysRanDType *systemRan[8];
-    sim4_ROS2_delta_M->extModeInfo = (&rt_ExtModeInfo);
-    rteiSetSubSystemActiveVectorAddresses(&rt_ExtModeInfo, systemRan);
-    systemRan[0] = &rtAlwaysEnabled;
-    systemRan[1] = &rtAlwaysEnabled;
-    systemRan[2] = &rtAlwaysEnabled;
-    systemRan[3] = &rtAlwaysEnabled;
-    systemRan[4] = (sysRanDType *)
-      &sim4_ROS2_delta_DW.EnabledSubsystem_SubsysRanBC_a;
-    systemRan[5] = &rtAlwaysEnabled;
-    systemRan[6] = (sysRanDType *)
-      &sim4_ROS2_delta_DW.EnabledSubsystem_SubsysRanBC;
-    systemRan[7] = &rtAlwaysEnabled;
-    rteiSetModelMappingInfoPtr(sim4_ROS2_delta_M->extModeInfo,
-      &sim4_ROS2_delta_M->SpecialInfo.mappingInfo);
-    rteiSetChecksumsPtr(sim4_ROS2_delta_M->extModeInfo,
-                        sim4_ROS2_delta_M->Sizes.checksums);
-    rteiSetTPtr(sim4_ROS2_delta_M->extModeInfo, rtmGetTPtr(sim4_ROS2_delta_M));
-  }
 
   // Start for MATLABSystem: '<S5>/SourceBlock'
   sim4_ROS2_delta_DW.obj_l.QOSAvoidROSNamespaceConventions = false;
@@ -414,14 +338,6 @@ void sim4_ROS2_delta_initialize(void)
   sim4_ROS2_delta_DW.obj_l.isInitialized = 1;
   sim4_ROS2__Subscriber_setupImpl(&sim4_ROS2_delta_DW.obj_l);
   sim4_ROS2_delta_DW.obj_l.isSetupComplete = true;
-
-  // Start for MATLABSystem: '<S6>/SourceBlock'
-  sim4_ROS2_delta_DW.obj_d.QOSAvoidROSNamespaceConventions = false;
-  sim4_ROS2_delta_DW.obj_d.matlabCodegenIsDeleted = false;
-  sim4_ROS2_delta_DW.obj_d.isSetupComplete = false;
-  sim4_ROS2_delta_DW.obj_d.isInitialized = 1;
-  sim4_ROS_Subscriber_setupImpl_m(&sim4_ROS2_delta_DW.obj_d);
-  sim4_ROS2_delta_DW.obj_d.isSetupComplete = true;
 
   // Start for MATLABSystem: '<S4>/SinkBlock'
   sim4_ROS2_delta_DW.obj.QOSAvoidROSNamespaceConventions = false;
@@ -433,7 +349,7 @@ void sim4_ROS2_delta_initialize(void)
 }
 
 // Model terminate function
-void sim4_ROS2_delta_terminate(void)
+void sim4_ROS2_delta::terminate()
 {
   // Terminate for MATLABSystem: '<S5>/SourceBlock'
   if (!sim4_ROS2_delta_DW.obj_l.matlabCodegenIsDeleted) {
@@ -446,16 +362,6 @@ void sim4_ROS2_delta_terminate(void)
 
   // End of Terminate for MATLABSystem: '<S5>/SourceBlock'
 
-  // Terminate for MATLABSystem: '<S6>/SourceBlock'
-  if (!sim4_ROS2_delta_DW.obj_d.matlabCodegenIsDeleted) {
-    sim4_ROS2_delta_DW.obj_d.matlabCodegenIsDeleted = true;
-    if ((sim4_ROS2_delta_DW.obj_d.isInitialized == 1) &&
-        sim4_ROS2_delta_DW.obj_d.isSetupComplete) {
-      Sub_sim4_ROS2_delta_76.resetSubscriberPtr();//();
-    }
-  }
-
-  // End of Terminate for MATLABSystem: '<S6>/SourceBlock'
   // Terminate for MATLABSystem: '<S4>/SinkBlock'
   if (!sim4_ROS2_delta_DW.obj.matlabCodegenIsDeleted) {
     sim4_ROS2_delta_DW.obj.matlabCodegenIsDeleted = true;
@@ -466,6 +372,38 @@ void sim4_ROS2_delta_terminate(void)
   }
 
   // End of Terminate for MATLABSystem: '<S4>/SinkBlock'
+}
+
+// Constructor
+sim4_ROS2_delta::sim4_ROS2_delta() :
+  sim4_ROS2_delta_B(),
+  sim4_ROS2_delta_DW(),
+  sim4_ROS2_delta_M()
+{
+  // Currently there is no constructor body generated.
+}
+
+// Destructor
+sim4_ROS2_delta::~sim4_ROS2_delta()
+{
+  // Currently there is no destructor body generated.
+}
+
+// Real-Time Model get method
+RT_MODEL_sim4_ROS2_delta_T * sim4_ROS2_delta::getRTM()
+{
+  return (&sim4_ROS2_delta_M);
+}
+
+const char_T* RT_MODEL_sim4_ROS2_delta_T::getErrorStatus() const
+{
+  return (errorStatus);
+}
+
+void RT_MODEL_sim4_ROS2_delta_T::setErrorStatus(const char_T* const volatile
+  aErrorStatus)
+{
+  (errorStatus = aErrorStatus);
 }
 
 //

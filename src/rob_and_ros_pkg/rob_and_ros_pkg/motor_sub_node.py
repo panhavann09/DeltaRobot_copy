@@ -1,71 +1,143 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
-import sys
 import math
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float64
-
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from custom_messages.msg import DeltaJointAngles
 from rob_and_ros_pkg.robstride_controller import PositionController
 
+MOTOR_IDS = [1, 2, 3]   # adjust to your CAN IDs
 
-class MotorSubscriber(Node):
+class DeltaMotorSubscriber(Node):
+    def __init__(self):
+        super().__init__('delta_motor_sub_node')
 
-    def __init__(self, motor_id):
-        super().__init__('motor_sub_node')
+        self.controllers = {}
+        for mid in MOTOR_IDS:
+            ctrl = PositionController(mid)
+            if not ctrl.connect():
+                # disconnect any that already connected, then bail
+                for c in self.controllers.values():
+                    c.stop_and_exit()
+                raise RuntimeError(f"Motor {mid} connection failed")
+            self.controllers[mid] = ctrl
 
-        self.controller = PositionController(motor_id)
-
-        if not self.controller.connect():
-            self.get_logger().error("Motor connection failed")
-            return
-
-        self.subscription = self.create_subscription(
-            Float64,
-            '/motor_angle',
-            self.angle_callback,
-            10
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,          # always act on the freshest target
         )
+        self.subscription = self.create_subscription(
+            DeltaJointAngles,
+            '/delta/matlab/joint_thetas',
+            self.angle_callback,
+            qos,
+        )
+        self.get_logger().info("✅ Delta Motor Subscriber Ready (3 motors)")
 
-        self.get_logger().info("✅ Motor Subscriber Ready")
-
-    def angle_callback(self, msg: Float64):
-
-        angle = float(msg.data)
-
-        # send relative command
-        self.controller.set_angle_relative(angle)
+    def angle_callback(self, msg: DeltaJointAngles):
+        # Assumes Simulink sends ABSOLUTE angles in RADIANS
+        targets = [msg.theta1, msg.theta2, msg.theta3]
+        for mid, target_rad in zip(MOTOR_IDS, targets):
+            ctrl = self.controllers[mid]
+            delta_deg = math.degrees(target_rad) - math.degrees(ctrl.position)
+            ctrl.set_angle_relative(delta_deg)
 
         self.get_logger().info(
-            f"Command: {angle:.2f}° | "
-            f"Current: {math.degrees(self.controller.position):.2f}°"
+            "Target [deg]: " + ", ".join(f"{math.degrees(t):.2f}" for t in targets)
         )
 
     def destroy_node(self):
-        self.controller.stop_and_exit()
+        for ctrl in self.controllers.values():
+            ctrl.stop_and_exit()
         super().destroy_node()
 
-
 def main(args=None):
-
-    if len(sys.argv) < 2:
-        print("Usage: ros2 run rob_and_ros_pkg motor_sub_node <motor_id>")
-        return
-
-    motor_id = int(sys.argv[1])
-
     rclpy.init(args=args)
-    node = MotorSubscriber(motor_id)
-
+    node = None
     try:
+        node = DeltaMotorSubscriber()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except RuntimeError as e:
+        print(f"Startup failed: {e}")
+    finally:
+        if node is not None:
+            node.destroy_node()
+        rclpy.shutdown()
 
-    node.destroy_node()
-    rclpy.shutdown()
+if __name__ == '__main__':
+    main()#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import math
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from custom_message.msg import DeltaJointAngles
+from rob_and_ros_pkg.robstride_controller import PositionController
 
+MOTOR_IDS = [1, 2, 3]   # adjust to your CAN IDs
+
+class DeltaMotorSubscriber(Node):
+    def __init__(self):
+        super().__init__('delta_motor_sub_node')
+
+        self.controllers = {}
+        for mid in MOTOR_IDS:
+            ctrl = PositionController(mid)
+            if not ctrl.connect():
+                # disconnect any that already connected, then bail
+                for c in self.controllers.values():
+                    c.stop_and_exit()
+                raise RuntimeError(f"Motor {mid} connection failed")
+            self.controllers[mid] = ctrl
+
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,          # always act on the freshest target
+        )
+        self.subscription = self.create_subscription(
+            DeltaJointAngles,
+            '/delta/matlab/joint_thetas',
+            self.angle_callback,
+            qos,
+        )
+        self.get_logger().info("✅ Delta Motor Subscriber Ready (3 motors)")
+
+    def angle_callback(self, msg: DeltaJointAngles):
+        # Assumes Simulink sends ABSOLUTE angles in RADIANS
+        targets = [msg.theta1, msg.theta2, msg.theta3]
+        for mid, target_rad in zip(MOTOR_IDS, targets):
+            ctrl = self.controllers[mid]
+            delta_deg = math.degrees(target_rad) - math.degrees(ctrl.position)
+            ctrl.set_angle_relative(delta_deg)
+
+        self.get_logger().info(
+            "Target [deg]: " + ", ".join(f"{math.degrees(t):.2f}" for t in targets)
+        )
+
+    def destroy_node(self):
+        for ctrl in self.controllers.values():
+            ctrl.stop_and_exit()
+        super().destroy_node()
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = None
+    try:
+        node = DeltaMotorSubscriber()
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    except RuntimeError as e:
+        print(f"Startup failed: {e}")
+    finally:
+        if node is not None:
+            node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

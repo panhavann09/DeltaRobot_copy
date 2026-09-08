@@ -7,18 +7,32 @@
 //
 // Code generated for Simulink model 'sim4_ROS2_delta'.
 //
-// Model version                  : 1.230
+// Model version                  : 1.367
 // Simulink Coder version         : 25.2 (R2025b) 28-Jul-2025
-// C/C++ source code generated on : Thu Jul  2 13:41:44 2026
+// C/C++ source code generated on : Sat Aug 22 08:20:52 2026
 //
 // Target selection: ert.tlc
-// Embedded hardware selection: AMD->x86-64 (Windows64)
+// Embedded hardware selection: ARM Compatible->ARM Cortex-A (64-bit)
 // Code generation objectives: Unspecified
 // Validation result: Not run
 //
 #ifndef rtmodel_h_
 #define rtmodel_h_
 #include "sim4_ROS2_delta.h"
+#define MODEL_CLASSNAME                sim4_ROS2_delta
+#define MODEL_STEPNAME                 step
+
+//
+//  ROOT_IO_FORMAT: 0 (Individual arguments)
+//  ROOT_IO_FORMAT: 1 (Structure reference)
+//  ROOT_IO_FORMAT: 2 (Part of model data structure)
+
+#define ROOT_IO_FORMAT                 1
+
+// Macros generated for backwards compatibility
+#ifndef rtmGetStopRequested
+#define rtmGetStopRequested(rtm)       ((void*) 0)
+#endif
 #endif                                 // rtmodel_h_
 
 //

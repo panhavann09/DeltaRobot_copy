@@ -2,13 +2,15 @@
 COLOR_TOPIC = "/camera/camera/color/image_raw"
 DEPTH_TOPIC = "/camera/camera/aligned_depth_to_color/image_raw"
 CAMERA_INFO_TOPIC = "/camera/camera/color/camera_info"
+TRACKED_PLANTS_TOPIC = "/plant_perception/tracked_plants"   # weed_bridge_node input, must match plant_perception's config/perception.yaml
+PLANT_PERCEPTION_VISUALIZATION_TOPIC = "/plant_perception/visualization"   # base image for weed_bridge_node's "Delta Camera" window
 
 DETECTION_MODE = "orange_blob"
 YOLO_MODEL = "yolo11n.pt"
 YOLO_IMGSZ = 1280
 YOLO_IOU = 0.45
 YOLO_MAX_DET = 20
-YOLO_DEVICE = "cpu"
+YOLO_DEVICE = "cuda:0"
 CONF_THRES = 0.25
 TARGET_CLASS = None
 VIEW_IMAGE = True
@@ -29,23 +31,6 @@ BBOX_FRAME_MIN_HEIGHT_PX = 40
 BBOX_NMS_IOU = 0.35
 CANNY_LOW = 60
 CANNY_HIGH = 180
-
-BLUE_RECT_HUE_LOW  = 100       # OpenCV H (0-180): start of blue band
-BLUE_RECT_HUE_HIGH = 130       # end of blue band
-BLUE_RECT_SAT_MIN  = 80        # minimum saturation — rejects washed-out / gray regions
-BLUE_RECT_VAL_MIN  = 50        # minimum value — rejects near-black shadows
-BLUE_RECT_MIN_SAT_MEAN   = 100.0   # mean saturation inside contour (replaces contrast check)
-BLUE_RECT_MIN_AREA_PX    = 600.0
-BLUE_RECT_MAX_AREA_RATIO = 0.12
-BLUE_RECT_MIN_WIDTH_PX   = 24
-BLUE_RECT_MIN_HEIGHT_PX  = 24
-BLUE_RECT_BORDER_REJECT_PX     = 10
-BLUE_RECT_MASK_OPEN_PX         = 3
-BLUE_RECT_MASK_CLOSE_PX        = 7
-BLUE_RECT_POLY_EPSILON_SCALE   = 0.05
-BLUE_RECT_MIN_RECTANGULARITY   = 0.76
-BLUE_RECT_MIN_ASPECT_RATIO     = 1.05
-BLUE_RECT_MAX_ASPECT_RATIO     = 4.50
 
 ORANGE_SQ_HUE_LOW  = 5        # OpenCV H (0-180): start of orange band
 ORANGE_SQ_HUE_HIGH = 30       # end of orange band
@@ -75,22 +60,6 @@ ORANGE_SQ_MIN_RECTANGULARITY  = 0.76
 ORANGE_SQ_MIN_ASPECT_RATIO    = 0.75  # square: allow slight perspective
 ORANGE_SQ_MAX_ASPECT_RATIO    = 1.33
 
-WHITE_RECT_MIN_AREA_PX = 600.0
-WHITE_RECT_MAX_AREA_RATIO = 0.12
-WHITE_RECT_MIN_WIDTH_PX = 24
-WHITE_RECT_MIN_HEIGHT_PX = 24
-WHITE_RECT_MIN_BRIGHTNESS = 180
-WHITE_RECT_MAX_SATURATION = 80
-WHITE_RECT_MIN_CONTRAST = 28.0
-WHITE_RECT_MASK_OPEN_PX = 3
-WHITE_RECT_MASK_CLOSE_PX = 7
-WHITE_RECT_BORDER_REJECT_PX = 10
-WHITE_RECT_POLY_EPSILON_SCALE = 0.05
-WHITE_RECT_MIN_RECTANGULARITY = 0.76
-WHITE_RECT_MIN_ASPECT_RATIO = 1.05
-WHITE_RECT_MAX_ASPECT_RATIO = 4.50
-WHITE_RECT_SUBPIX_WINDOW = 5
-
 PLANE_HOMOGRAPHY_ENABLE = False
 PLANE_HOMOGRAPHY_MATRIX = (
     (1.0, 0.0, 0.0),
@@ -114,6 +83,10 @@ ROBOT_EXCLUDE_POLYGONS_NORM = (
 ROBOT_EXCLUDE_MAX_BBOX_OVERLAP = 0.12
 ROBOT_EXCLUDE_MAX_CONTOUR_OVERLAP = 0.08
 DRAW_ROBOT_EXCLUDE = False
+
+# weed_bridge_node: skip a weed candidate whose bbox overlaps a currently
+# tracked crop's bbox above this IoU-style ratio (avoid picking near a crop).
+WEED_CROP_OVERLAP_MAX_IOU = 0.10
 FOREGROUND_FLOOR_DEPTH_M = 0.870
 FOREGROUND_FLOOR_PERCENTILE = 80.0
 FOREGROUND_BG_CLOSE_PX = 41
@@ -164,17 +137,24 @@ DEPTH_MAX_JUMP_M = 0.015
 
 # Home position — θ1=θ2=θ3=0° exactly (arms horizontal). Actual homing goes
 # through move_thetas(0,0,0), bypassing IK; this Z is FK(0,0,0) for reference
-# only (e.g. pre-position height, logging). delta_calcForward(0,0,0,...) = -323.531mm.
+# only (e.g. pre-position height, logging). solve_fk_mm(0,0,0) = -228.644mm
+# (recomputed for the corrected DeltaGeometry kinematics; was -323.531mm under
+# the old e/f/re/rf model).
 HOME_X =   0.0
 HOME_Y =   0.0
-HOME_Z = -323.531
+HOME_Z = -228.644
 
-# Drop at belt exit edge — Y = -150mm
-PLACE_X =  150.0
-PLACE_Y = -150.0
+# Drop near belt exit — pulled in from the (-150,150) edge point (only 4.1deg
+# joint-limit margin, theta2=85.9deg there at Z=-390) toward workspace centre
+# for a safer 15.3deg margin (theta2=74.7deg). Verify this still lands in the
+# collection bin/chute before running unattended — it's ~42mm inward of the
+# old edge-of-belt drop point.
+PLACE_X = -120.2
+PLACE_Y =  120.2
 
-PLACE_Z = -483.5   # wrist Z for place  (EE tip = PLACE_Z - 150 = -633.5mm, 30mm above belt@-663.5)
-PICK_Z  = -483.5   # wrist Z for pick   (EE tip = PICK_Z  - 150 = -633.5mm, 30mm above belt@-663.5)
+PLACE_Z = -330.0   # wrist Z for place — was -483.5 (theta2=110.4deg, unreachable,
+                    # aborted every place). -390 is reachable with margin at PLACE_X/Y above.
+PICK_Z  = -450   # wrist Z for pick   (EE tip = PICK_Z  - 150 = -633.5mm, 30mm above belt@-663.5)
 # Tip target -633.5mm is only 4.5mm above EETIP_Z_FLOOR_MM(-638.0, confirmed crash) — verify
 # with a slow manual descent before running full-speed automated cycles.
 
@@ -186,7 +166,7 @@ TRAJ_A_MAX_MM_S2 = 5000.0
 # Gives the object time to arrive if Y prediction is still slightly off.
 # Increase in small steps (0.1 s) if robot still arrives before object.
 CONVEYOR_APPROACH_WAIT_SEC = 0.3   # short motor-settle; arrival now handled dynamically
-CONVEYOR_ARRIVAL_Y_THRESH_MM = 15.0  # pick when |err_y| < this (object within 15mm in Y)
+CONVEYOR_ARRIVAL_X_THRESH_MM = 15.0  # pick when |err_x| < this (object within 15mm in X)
 CONVEYOR_ARRIVAL_TIMEOUT_S   = 5.0   # give up and pick anyway after 5s
 
 # Static EE correction offsets (mm).  Measure the real error at your target
@@ -194,15 +174,15 @@ CONVEYOR_ARRIVAL_TIMEOUT_S   = 5.0   # give up and pick anyway after 5s
 # +X, set EE_OFFSET_X_MM = -10.0.
 EE_OFFSET_X_MM = 0.0
 EE_OFFSET_Y_MM = 0.0
-EE_OFFSET_Z_MM   = 150.0   # gripper length below platform (mm); tip = platform - 150, platform = tip + 150
+EE_OFFSET_Z_MM   = 150.0   # gripper length below platform (mm); measured gripper length
 
-FAKE_DEPTH_ENABLE = True
-FAKE_DEPTH_M = 0.620       # camera-to-belt distance (m), measured directly → z_base=-675mm, z_platform=-525mm
+FAKE_DEPTH_ENABLE = True   # always use FAKE_DEPTH_M — no depth stream on the global-shutter camera
+FAKE_DEPTH_M = 0.58  # camera-to-belt/ground distance (m), measured directly 2026-09-02
 
 ERROR_MAP_ENABLE = False
 
-MOTOR_VEL_MAX    = 25.0  # PP mode max velocity — increase for faster moves (was 3.0; motor spec max 50)
-MOTOR_ACC_SET    = 30.0  # PP mode acceleration — increase for snappier starts (was 5.0)
+MOTOR_VEL_MAX    = 40.0  # PP mode max velocity — increase for faster moves (was 3.0; motor spec max 50)
+MOTOR_ACC_SET    = 40.0  # PP mode acceleration — increase for snappier starts (was 5.0)
 FK_VERIFY_TOL_MM = 3.0
 PRINT_COOLDOWN_SEC = 1.0
 FAKE_MOVE_COOLDOWN_SEC = 1.0
@@ -215,7 +195,8 @@ MOVE_THRESHOLD_MM = 4.0
 # model validated), plate_to_tip=150mm (fixed), tip_to_belt=190mm.
 # home tip Z (FK) = -473.531mm
 # z_base = home_tip_Z - tip_to_belt(190) = -663.531mm = belt surface (tip frame)
-# z_platform = z_base + EE_OFFSET_Z_MM(150) = -513.531mm = belt surface (wrist/platform frame)
+# z_platform = z_base + EE_OFFSET_Z_MM(150) = -513.531mm =  
+#  surface (wrist/platform frame)
 
 # Fixed fake object position for testing EE correction
 # Set FAKE_OBJ_ENABLE = True to use fixed position
@@ -223,7 +204,7 @@ MOVE_THRESHOLD_MM = 4.0
 
 
 VISION_ONLY_ENABLE = False
-SIMPLE_RESULT_PRINT = False
+SIMPLE_RESULT_PRINT = True
 PURE_CAMERA_TEST_ENABLE = False
 
 # Conveyor belt mode: skip stability check (object is always moving).
@@ -234,14 +215,25 @@ CONVEYOR_MODE = True
 # Stepper motor: MIN_DELAY=70µs, STEPS_PER_REV=1600, GEAR_RATIO=36, PULLEY_DIA=49mm
 #   Motor RPM  = 60_000_000 / (2 × 70 × 1600) = 267.86 RPM
 #   Output RPM = 267.86 / 36                   = 7.44  RPM
-#   Belt mm/s  = (7.44 × π × 49) / 60         = 19.09 mm/s  ← design maximum
-#   Measured physical speed: 12.85 mm/s (stepper running below design maximum)
-CONVEYOR_BELT_SPEED_MM_S = 12.85   # mm/s — physically measured
+#   Belt mm/s  = (7.44 × π × 49) / 60         = 19.09 mm/s  ← old design-math estimate
+#   Measured physical speed: 26.0 mm/s (2026-07-09 remeasurement; exceeds the
+#   stepper-math estimate above — re-derive pulley/gearing if that gap matters)
+# 2026-08-17: swapped to the field tractor rig — 0.5 m/s ground speed.
+CONVEYOR_BELT_SPEED_MM_S = 500.0   # mm/s — 0.5 m/s tractor ground speed
 
 # Velocity sanity bounds: camera estimate is rejected if it falls outside this range.
 # Lower bound covers belt not yet at speed; upper bound catches outlier regression.
-CONVEYOR_VY_MIN_MM_S =  1.0    # below this → belt probably stopped, use 0
-CONVEYOR_VY_MAX_MM_S = 25.0    # above this → regression outlier, clamp to design speed
+CONVEYOR_VX_MIN_MM_S =  1.0    # below this → belt probably stopped, use 0
+CONVEYOR_VX_MAX_MM_S = 600.0   # above this → regression outlier, clamp to design speed
+
+# False: matlab_bridge_node.py grips the raw detected/depth-smoothed object
+# pose directly — no belt-velocity lead compensation, no travel/descend timing
+# offset. For bench-testing pure Cartesian pick accuracy without conveyor
+# motion in the loop. True restores the BeltPredictor lead correction.
+# Disabled 2026-07-22: switching matlab_bridge_node.py back to USE_MATLAB=True
+# (real MATLAB IK round-trip) — testing that path on its own first, without
+# belt-lead compensation stacked on top.
+BELT_PREDICTION_ENABLE = False
 
 # Minimum seconds between consecutive target publishes to avoid flooding the robot.
 TARGET_PUBLISH_COOLDOWN_SEC = 1.0
@@ -250,7 +242,39 @@ TARGET_PUBLISH_COOLDOWN_SEC = 1.0
 # Projects the robot reachable square (±X_LIMIT, ±Y_LIMIT) at WORKSPACE_PICK_Z_MM
 # and draws three coloured zones: approach (amber), workspace (green), exit (red).
 DRAW_WORKSPACE_ZONES = True
-WORKSPACE_PICK_Z_MM  = -513.5   # platform Z at pick height (EE tip 150mm below = belt)
+# platform Z at pick height (EE tip 150mm below = belt). Re-derived for the
+# corrected DeltaGeometry kinematics by applying the same shift as HOME_Z
+# (new HOME_Z -228.644 vs old-model HOME_Z -323.531 = +94.887mm): the old
+# value (-513.5) was computed against the old (wrong) FK and is now
+# unreachable at all 4 box corners. Like X_LIMIT/Y_LIMIT, this square is a
+# rectangular over-approximation — corners are drawn for reference even
+# where IK doesn't quite hold at this exact Z.
+WORKSPACE_PICK_Z_MM  = -418.6
+
+# ADRC-flavored persistent bias corrector for Cartesian tracking error (PP
+# mode scoped -- only the commanded position reference can be biased, no
+# torque/gain access). Learns a per-axis additive bias from move_xyz()'s
+# existing FK feedback; no new sensing. In-memory only, resets on restart.
+# Default OFF -- opt-in, zero behavior change until explicitly enabled.
+ADRC_BIAS_ENABLE     = False   # on for repeatability_test.py bias validation (static/moving belt)
+ADRC_BIAS_BETA       = 0.25   # leaky-integrator gain; ~8 cycles to ~90% of true bias
+ADRC_BIAS_MAX_MM     = 8.0    # clamp on |d_hat| per axis
+ADRC_BIAS_MIN_ERR_MM = 1.0    # deadband (2x POS_TOL_MM); ignore residuals below this
+
+# Operation Control ("MIT") mode -- run_mode=0, host streams pset/vset/Kp/Kd/tau_ff
+# every frame (see thesis Table 4.2). Used by DeltaMotorController.move_xyz_mit() /
+# move() dispatch for the PP-vs-MIT repeatability comparison. Kp/Kd seeded from the
+# rob_and_ros_pkg prototype -- MUST be re-verified on hardware (small jog, watch for
+# oscillation/overshoot) before running a full repeatability sweep at these gains.
+MIT_KP           = 15.0    # N*m/rad, per-joint proportional gain
+MIT_KD           = 5.0     # N*m/(rad/s), per-joint derivative gain
+MIT_CONTROL_HZ   = 100.0   # setpoint stream rate; thesis notes torque modes want ~1kHz --
+                            # treat the achievable rate on this ROS2/USB-CAN stack as a finding
+MIT_V_MAX_MMPS   = 214.0   # Cartesian transport speed, matches PP run's paper-referenced speed
+MIT_A_MAX_MMPS2  = 800.0   # Cartesian accel for linear_waypoints(); placeholder, tune during bring-up
+MIT_HOLD_TIME_S  = 0.3     # extra time streaming the final setpoint before the move ends
+MIT_FK_FAULT_MM  = 15.0    # host-side fault threshold (PP mode gets this from firmware for free)
+MIT_FK_FAULT_N   = 5       # consecutive over-threshold cycles before aborting the move
 
 # EE marker detection (white laser dot on end-effector tip)
 EE_CORRECTION_ENABLE    = True
@@ -277,47 +301,62 @@ EE_LASER_SMOOTH_FRAMES = 5     # 5-frame median
 EE_LASER_ROI_PX        = 35    # search radius around last position (px)
 DRAW_EE_MARKER         = True
 # Shift the overlay box in the camera stream without affecting 3D detection.
-# Positive X_OFFSET_MM moves box right in robot base frame (→ left in image).
-# Positive Y_OFFSET_MM moves box toward the approach side (belt entry direction).
+# Positive X_OFFSET_MM moves box toward the approach side (belt entry direction).
+# Positive Y_OFFSET_MM moves box right in robot base frame (→ left in image).
 WORKSPACE_OVERLAY_X_OFFSET_MM = 0.0
 WORKSPACE_OVERLAY_Y_OFFSET_MM = 0.0
 
 CAMERA_TRANSFORM_MODE = "A"
 CAMERA_USE_DIRECT_MATRIX = True
 
-# Rotation: x_base = -x_cam,  y_base = y_cam,  z_base = -z_cam
+# Rotation: x_base = y_cam,  y_base = x_cam,  z_base = -z_cam
 # Measured mount: Y = 300 mm in front of base, Z = 80 mm above base origin
 # Working distance to home (z=-350): 80 + 350 = 430 mm
 CAMERA_DIRECT_MATRIX = (
-    (-1.0,  0.0,  0.0),
     ( 0.0,  1.0,  0.0),
+    ( 1.0,  0.0,  0.0),
     ( 0.0,  0.0, -1.0),
 )
 CAM_FINE_ROLL_DEG  = 0.0
 CAM_FINE_PITCH_DEG = 0.0
 CAM_FINE_YAW_DEG   = 0.0
-CAM_TX_MM =  -15.0   # tuning — adjust in ±10mm steps until green box centres under arm
-CAM_TY_MM = 233.0    # calibrated: object at actual y=113mm detected as y=65mm → +48mm correction
-CAM_TZ_MM =  -43.5   # derived: belt tip Z(-663.5) + cam_to_belt(620) = camera is 43.5mm below base frame origin
+CAM_TX_MM =220.0   # calibrated via fixed EE laser at true center (30-sample avg, reproduced across 2 runs)
+CAM_TY_MM =0.0    # calibrated via fixed EE laser at true center (30-sample avg, reproduced across 2 runs)
+CAM_TZ_MM =0   # camera Z == base-frame origin Z (measured directly 2026-09-02, no offset)
 
 # Full 4×4 homogeneous T_cam_to_base  (p_base = T @ [p_cam; 1])
 # Built from the R and t above — use camera_system._build_T_cam_to_base() at runtime
 CAMERA_T_BASE = (
-    (-1.0,  0.0,  0.0,  CAM_TX_MM),
-    ( 0.0,  1.0,  0.0, CAM_TY_MM),
+    ( 0.0,  1.0,  0.0,  CAM_TX_MM),
+    ( 1.0,  0.0,  0.0, CAM_TY_MM),
     ( 0.0,  0.0, -1.0,  CAM_TZ_MM),
     ( 0.0,  0.0,  0.0,    1.0),
 )
 
-X_LIMIT = 150.0   # rectangular pre-filter; IK in check_workspace rejects unreachable corners
-Y_LIMIT = 150.0
-Z_MIN = -650.0
-# Actual IK ceiling at centre: -sqrt(re^2 - (rf + (f-e)*tan30/2)^2) ≈ -323.5 mm.
-# The old value (-196.875) was geometrically wrong; any Z above -323 fails IK.
-Z_MAX = -323.0
+# Rectangular pre-filter — real per-point gating is the solve_ik_mm() call in
+# check_workspace, so this box only needs to be a loose over-approximation.
+# 2026-08-19: at WORKSPACE_PICK_Z_MM the true IK-feasible region is a lobed
+# shape (3 arms at 180/300/60 deg), not a square — max reach measured by
+# azimuth: ~207mm toward each arm (az 0/120/240), ~218mm at az 90/270,
+# ~252mm between arms (az 60/180/300). The old 200mm box under-used reach in
+# every direction (e.g. az=180 real max ~252mm) while its corners (283mm out)
+# were always past 90 deg on some arm and rejected downstream anyway. Raised
+# to 255mm — covers the full lobe with small margin; check_workspace's IK
+# call still correctly rejects the still-unreachable corner regions.
+X_LIMIT = 220.0
+Y_LIMIT = 220.0
+Z_MIN = -650.0   # NOTE: not re-derived for the new DeltaGeometry — solve_ik_mm(0,0,z)
+                 # already fails by z=-600 at centre, so this floor is now looser than
+                 # actually reachable (safe: the IK feasibility check in check_workspace
+                 # still rejects unreachable points, just later than an exact bound would).
+# IK ceiling at centre (theta=0) under the corrected DeltaGeometry is
+# solve_fk_mm(0,0,0) = -228.644mm (see HOME_Z). Z_MAX kept ~0.6mm shallower than
+# that, mirroring the old model's margin, so the box pre-filter stays permissive
+# and the real feasibility check in check_workspace does the rejecting.
+Z_MAX = -228.0
 
 THETA1_MIN = -5
-THETA1_MAX = 90   # physical hard stop observed at ~56° — use 54° with 2° margin
+THETA1_MAX = 90   # verified on hardware 2026-07-21: 90 deg is safe
 THETA2_MIN = -5
 THETA2_MAX = 90.0
 THETA3_MIN = -5
