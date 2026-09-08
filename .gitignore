@@ -24,6 +24,9 @@ env/
 *.pt
 *.onnx
 *.engine
+# ...except the one engine the deployed pipeline actually loads (model_path
+# in plant_perception/config/perception*.yaml) — small enough to track.
+!src/weight/best.engine
 
 # IDE
 .vscode/
