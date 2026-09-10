@@ -86,7 +86,15 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument("align_depth_enable", default_value="true"),
-        DeclareLaunchArgument("color_profile", default_value="640x480x15"),
+        # 2026-09-08: raised to 1920x1080 to feed tiled inference (see
+        # plant_perception/tiled_inference.py + perception.yaml's
+        # tile_size/tile_overlap). depth_profile intentionally NOT matched to
+        # 1920x1080 — the D455's depth sensor doesn't natively run there, and
+        # align_depth.enable reprojects into color space regardless of the
+        # depth stream's native resolution. VERIFY this color_profile is
+        # actually supported by the attached camera before relying on it
+        # (`rs-enumerate-devices -c` on-device).
+        DeclareLaunchArgument("color_profile", default_value="1920x1080x15"),
         DeclareLaunchArgument("depth_profile", default_value="640x480x15"),
         DeclareLaunchArgument("enable_accel", default_value="false"),
         DeclareLaunchArgument("enable_gyro", default_value="false"),

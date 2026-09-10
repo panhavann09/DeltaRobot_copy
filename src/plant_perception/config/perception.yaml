@@ -2,12 +2,12 @@
 plant_perception_node:
   ros__parameters:
     # Detection
-    model_path: "src/weight/best.engine"
+    model_path: "src/weight/best_fp16.engine"
     imgsz: 640
     conf_thres: 0.25
     iou_thres: 0.45
     device: "tensorrt"
-    trt_fp16_enable: false
+    trt_fp16_enable: true
     target_fps: 30.0
 
     # Tracking
@@ -17,7 +17,7 @@ plant_perception_node:
     new_track_thresh: 0.40
     track_buffer: 15
     match_thresh: 0.75
-    frame_rate: 15
+    frame_rate: 30.0
 
     # Track stability
     minimum_confirm_hits: 3
@@ -47,6 +47,30 @@ plant_perception_node:
     enable_visualization: true
     visualization_show_masks: false
     visualization_jpeg_quality: 80
+    # cv2.imencode of a full 1920x1080 frame measured 28.3ms vs 6.0ms at
+    # 960x540 — see perception_direct.yaml for the fuller story (this node's
+    # visualization still runs inline in sync_callback, not on its own
+    # thread — see plant_perception_node.py's declare_parameter comment).
+    # 0 disables downscaling.
+    visualization_max_width: 960
+
+    # Tiled inference (see tiled_inference.py) — splits the high-res frame
+    # into overlapping tiles run through the model individually instead of
+    # one full-frame downscale, so small/distant weeds keep more detail.
+    # 2026-09-08 SPEED TEST: tile_size >= max(camera_width, camera_height)
+    # collapses both axes to a single tile (see _axis_starts's dim <=
+    # tile_size branch) -> 1 inference pass/frame instead of 1088's 2 (which
+    # measured 7.7 FPS/92.1ms on the direct-camera pipeline, up from
+    # tile_size=960's buggy-grid 3.6 FPS/205ms). This is a deliberate
+    # detail-vs-speed trade: small/distant weeds get the same ~3x
+    # downscale-to-640 that tiling was added to avoid. Revert tile_size to
+    # 1088 (2 tiles) if far-weed detection misses matter more than hitting
+    # 15+ FPS. Capture resolution itself is set at the camera driver launch
+    # (see delta_main_app/launch/weed_pick_place_realsense.launch.py's
+    # color_profile arg), not here — this node just subscribes to whatever
+    # it publishes.
+    tile_size: 1920
+    tile_overlap: 96
 
     # Topics
     color_image_topic: "/camera/camera/color/image_raw"

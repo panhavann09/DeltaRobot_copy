@@ -6,12 +6,16 @@
 merge_code_test_node:
   ros__parameters:
     # Detection
-    model_path: "src/weight/best.engine"
+    # best_fp16.engine's content is actually the INT8 engine (verified by
+    # md5 against yolov11-seg-root-int8.engine) — best_fp16__copy.engine is
+    # the real fp16 weights (matches ~/yolo_bench_ws/best_fp16.engine, the
+    # one yolo_test_fp16_high.py uses and was found to detect weeds better).
+    model_path: "src/weight/best_fp16__copy.engine"
     imgsz: 640
     conf_thres: 0.25
     iou_thres: 0.45
     device: "tensorrt"
-    trt_fp16_enable: false
+    trt_fp16_enable: true
     target_fps: 30.0
 
     # Tracking
@@ -21,7 +25,7 @@ merge_code_test_node:
     new_track_thresh: 0.40
     track_buffer: 15
     match_thresh: 0.75
-    frame_rate: 15
+    frame_rate: 30
 
     # Track stability
     minimum_confirm_hits: 3
@@ -47,18 +51,82 @@ merge_code_test_node:
     enable_visualization: true
     visualization_show_masks: false
     visualization_jpeg_quality: 80
+    # 2026-09-08: a debug viewer attached to the visualization topic was
+    # throttling the actual detection/tracking rate down to the visualization
+    # encode/publish rate (measured FPS: 22 with no viewer -> 5.8-9.7 with
+    # one) since draw+encode+publish ran inline on the same thread as
+    # inference. Now on its own thread (merge_code_test.py's
+    # _visualization_loop) so it can lag behind without slowing
+    # tracked_plants; this just also shrinks what it has to encode/publish.
+    # 0 disables downscaling.
+    visualization_max_width: 960
+
+    # Tiled inference (see tiled_inference.py) — splits a high-res frame into
+    # overlapping tiles run through the model individually instead of one
+    # full-frame downscale, so small/distant weeds keep more detail.
+    # 2026-09-10: switched to the ~/yolo_bench_ws/yolo_test_fp16_high.py
+    # scheme — camera captures at 1280x720 (camera_width/height below),
+    # frame_crop_height center-crops 720->640 (rows 40:680) so the frame
+    # height exactly matches tile_size, then tile_size=640/tile_overlap=0
+    # splits the 1280-wide cropped frame into exactly two side-by-side
+    # 640x640 tiles with NO letterbox resize on either tile (each tile is
+    # already native imgsz). See merge_code_test.py's frame_crop_height
+    # parameter comment and _capture_loop (crop is applied once, right after
+    # capture, before inference/visualization/publish all see the frame).
+    tile_size: 640
+    tile_overlap: 0
 
     # Direct camera
-    camera_width: 640
-    camera_height: 480
-    camera_fps: 15
-    camera_device: "/dev/video0"
+    # 2026-09-08 raised this to 1920x1080 to feed tiled inference, then
+    # reverted 2026-09-09: merge_code_test.py's _build_camera_info_msg()
+    # publishes camera_fx/fy/cx/cy below unscaled regardless of capture
+    # resolution, but those were chessboard-calibrated AT 640x480 — running
+    # capture at 1920x1080 with this K matrix put every
+    # pixel_to_camera_xyz_mm() projection ~3x off-center, so every detected
+    # weed landed far outside X_LIMIT/Y_LIMIT (validate_target always
+    # returned OUTSIDE_WORKSPACE) and the robot never picked anything despite
+    # good detections.
+    #
+    # 2026-09-10: raised again to 1280x720 (see tile_size above) — this is
+    # STILL not the 640x480 the calibration below was done at (cx especially
+    # will be off: it assumes a 640-wide frame, this one is 1280 wide).
+    # _build_camera_info_msg() now shifts cy by frame_crop_height's crop_top
+    # to account for the vertical crop, but that does NOT fix cx/fx/fy for
+    # the wider frame — pixel_to_camera_xyz_mm() projections will be off
+    # until this camera/lens is rechecked at 1280x720. Detection/tracking
+    # (tracked_plants topic) is unaffected either way; only downstream
+    # pixel->mm picking math depends on the K matrix being right. Do not
+    # just scale the existing numbers (16:9 vs 4:3 is likely a different
+    # sensor crop/FOV, not a uniform scale) — recalibrate at 1280x720 (or
+    # 1280x640 post-crop) directly.
+    #
+    # Capture goes through a GStreamer pipeline in merge_code_test.py that
+    # decodes this camera's MJPG stream on Jetson's hardware JPEG decoder
+    # (nvv4l2decoder) instead of the CPU — requires camera_fourcc: "MJPG"
+    # (see merge_code_test.py's _open_camera_gst). Re-check
+    # `v4l2-ctl --list-formats-ext` for this camera's actual max fps at
+    # 1280x720 (it was 640x480-only verified previously) and lower camera_fps
+    # below if the requested rate isn't actually supported at this resolution.
+    camera_width: 1280
+    camera_height: 720
+    # Center-crops the captured frame's height 720 -> 640 (rows 40:680,
+    # i.e. -40px off the top and -40px off the bottom) before anything else
+    # sees it — see tile_size's comment above for why 640 was picked.
+    # 0 would disable cropping.
+    frame_crop_height: 640
+    camera_fps: 60
+    # /dev/videoN indices shift across reboots/USB re-enumeration — use the
+    # stable by-id symlink instead (ls /dev/v4l/by-id/ to re-derive if the
+    # camera is ever replaced).
+    camera_device: "/dev/v4l/by-id/usb-Global_Shutter_Camera_Global_Shutter_Camera_01.00.00-video-index0"
     camera_fourcc: "MJPG"
     # Chessboard calibration 2026-09-02, 14/16 captures (2 dropped: warped
     # printed board), RMS reproj error 1.34px — see
     # ~/delta_ws/camera_calibration/calibration_result.txt. Above the <0.5px
     # target; recalibrate with the board mounted on something rigid if
-    # picking accuracy from pixel_to_camera_xyz_mm() looks off.
+    # picking accuracy from pixel_to_camera_xyz_mm() looks off. Valid ONLY
+    # at 640x480 (camera_width/height above) — see the note there before
+    # ever raising capture resolution again.
     camera_fx: 520.1446
     camera_fy: 516.2572
     camera_cx: 320.4307

@@ -14,6 +14,17 @@ YOLO_DEVICE = "cuda:0"
 CONF_THRES = 0.25
 TARGET_CLASS = None
 VIEW_IMAGE = True
+# 2026-09-08: weed_bridge_node's "Delta Camera" window used to run EE-marker
+# laser detection + cv2.imshow/waitKey on every incoming frame (~20+ FPS from
+# plant_perception) — measured cost in isolation: imshow/waitKey ~38ms/frame,
+# EE-marker detection ~18ms/frame, stacking on top of plant_perception's own
+# ~49ms and dragging tracked_plants down to ~10.3 FPS system-wide (CPU
+# contention between the two processes' own work, confirmed via tegrastats:
+# all 6 cores pegged 75-92%, GPU bursty/idle waiting on CPU). Neither needs
+# to run faster than a human can watch a window, and _on_tracked_plants (the
+# actual weed-targeting math) never reads _last_ee_uv/_ee_fk_pixel, so both
+# are throttled to this rate instead of running inline on every frame.
+DISPLAY_MAX_FPS = 10.0
 DRAW_CAMERA_AXIS_LEGEND = False
 DRAW_BASE_AXIS_OVERLAY = False
 DRAW_DETECTION_CONTOUR = False
@@ -340,8 +351,8 @@ CAMERA_T_BASE = (
 # were always past 90 deg on some arm and rejected downstream anyway. Raised
 # to 255mm — covers the full lobe with small margin; check_workspace's IK
 # call still correctly rejects the still-unreachable corner regions.
-X_LIMIT = 220.0
-Y_LIMIT = 220.0
+X_LIMIT = 200.0
+Y_LIMIT = 200.0
 Z_MIN = -650.0   # NOTE: not re-derived for the new DeltaGeometry — solve_ik_mm(0,0,z)
                  # already fails by z=-600 at centre, so this floor is now looser than
                  # actually reachable (safe: the IK feasibility check in check_workspace
@@ -351,6 +362,30 @@ Z_MIN = -650.0   # NOTE: not re-derived for the new DeltaGeometry — solve_ik_m
 # that, mirroring the old model's margin, so the box pre-filter stays permissive
 # and the real feasibility check in check_workspace does the rejecting.
 Z_MAX = -228.0
+
+# Approach-zone band for pick_place_node.py's WAITING pre-position: a weed
+# still outside the workspace (validate_target reason="OUTSIDE_WORKSPACE")
+# counts as "approaching" once its X is within this margin of X_LIMIT on the
+# entry side (belt moves in -X — see belt_predictor.py — so weeds arrive
+# from +X). Weeds further out than this are ignored to avoid pre-positioning
+# for something still far up the belt that may never arrive.
+APPROACH_ZONE_MARGIN_MM = 80.0
+
+# Pre-position pose for the WAITING state: once a weed is approaching (see
+# APPROACH_ZONE_MARGIN_MM above) but still outside the workspace, the arm
+# parks here instead of sitting at HOME — closer to the entry edge, so the
+# final travel once the weed actually arrives is short.
+# WAIT_Z_MM is NOT HOME_Z: HOME_Z (-228.644) is the shallow ceiling height,
+# only reachable near X=0 — at WAIT_X_MM (near the +X edge) it's outside
+# joint limits (confirmed: solve_ik_mm(210,0,-228.6) gives theta2/3=-16deg,
+# below THETA_MIN=-5). The workspace's true reachable region is a lobed
+# shape, not the rectangular X/Y/Z_LIMIT box (see the box's own comments
+# above) — swept solve_ik_mm at (WAIT_X_MM, WAIT_Y_MM) to find the in-limits
+# Z band (roughly -280 to -400mm there) and picked -330 for margin
+# (theta1=78.8deg, ~11deg below the 90deg limit).
+WAIT_X_MM = X_LIMIT - 10.0   # just inside the reachable boundary, entry side (+X)
+WAIT_Y_MM = 0.0
+WAIT_Z_MM = -330.0   # platform-frame, like HOME_Z/PLACE_Z/PICK_Z
 
 THETA1_MIN = -5
 THETA1_MAX = 90   # verified on hardware 2026-07-21: 90 deg is safe

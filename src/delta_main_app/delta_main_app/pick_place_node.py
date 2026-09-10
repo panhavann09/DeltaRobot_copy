@@ -11,7 +11,12 @@ next queued pick or landing in IDLE.
 ━━━━ Topic map ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   Camera → Node    (subscribe):
       /delta/target_xyz            geometry_msgs/PointStamped
-          x/y/z in mm, robot base frame, EE-tip Z
+          x/y/z in mm, robot base frame, EE-tip Z — a CONFIRMED, reachable
+          target; triggers the real pick
+      /delta/approaching_target    custom_messages/DeltaTarget
+          a weed tracked but still outside the workspace, within the
+          approach-zone band (delta_weed_bridge) — triggers a WAITING
+          pre-position, not a pick
 
   Node → All       (publish):
       /delta/target_committed      custom_messages/DeltaTarget
@@ -23,8 +28,11 @@ next queued pick or landing in IDLE.
           motor-encoder feedback, published as telemetry after every move
 
 ━━━━ State machine ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  IDLE → MOVING(+grip) → HOMING(+release) ─┬─→ MOVING (next pick, chained)
-       ↘ ERROR ───────────────────────────┴─→ IDLE (no next pick queued)
+  IDLE → WAITING (pre-position) ─┬─→ MOVING(+grip) → LIFTING(+release) ─┬─→ MOVING (next pick, chained)
+       ↘ MOVING(+grip) ──────────┘        ↘ ERROR ──────────────────────┴─→ WAITING (no next pick queued —
+       (WAITING also times out back to IDLE if no weed arrives)              parks & waits for the next one)
+  No place/home step: LIFTING only rises LIFT_AFTER_PICK_MM straight up from
+  the pick point and releases there, then goes back to WAITING immediately.
 """
 
 import collections
@@ -51,6 +59,12 @@ from delta_motor_controller.pneumatic_gripper import PneumaticGripper
 # with the Z-guard/floor check gone, that overrun went uncaught and picks were
 # landing too deep. Target Z now matches the detected surface exactly.
 Z_DROP_EXTRA_MM      = -25.0    # extra descent commanded on pick (deeper = more negative)
+
+# No place step: after gripping, the FSM lifts straight up (same X/Y) by this
+# much and releases there instead of returning all the way home. TUNE this to
+# whatever clearance is needed to clear the belt/plants before the arm parks
+# back at WAITING.
+LIFT_AFTER_PICK_MM  = 50.0
 
 # Safety: maximum depth the local IK solver's result may command beyond the
 # detected target Z. If the FK of the solved thetas puts the EE-tip more than
@@ -91,13 +105,21 @@ class PickPlaceFSM:
     States
     ------
     IDLE            : home pose (theta=0,0,0), gripper open, waiting for a target
+    WAITING         : a weed is approaching but not yet reachable — parked at
+                      the fixed pre-position pose (config.WAIT_X/Y/Z_MM) to
+                      shorten the final travel once it actually arrives.
+                      A confirmed on_target() while WAITING interrupts the
+                      wait and goes straight to MOVING. Times out back to
+                      IDLE after config.CONVEYOR_ARRIVAL_TIMEOUT_S with no
+                      arrival (bg thread)
     MOVING          : executing the locally-solved IK thetas on the motors; grips
                       once settled (bg thread)
-    HOMING          : no lift, no place stop — drives straight to theta=0,0,0
-                      with the object gripped, releases once settled, then
-                      either chains straight into the next queued target
-                      (MOVING, no trip through IDLE) or lands IDLE
-                      (bg thread)
+    LIFTING         : no place stop — rises LIFT_AFTER_PICK_MM straight up
+                      from the pick point (same X/Y) with the object gripped,
+                      releases once settled there, then either chains
+                      straight into the next queued target (MOVING, no trip
+                      through WAITING) or returns to the WAIT pose and
+                      re-enters WAITING for the next weed (bg thread)
     ERROR           : any failure (invalid IK solution, unreachable thetas, or
                       a move that never settled) — forces the gripper open,
                       returns home, recovers to IDLE
@@ -122,9 +144,13 @@ class PickPlaceFSM:
         self._target_xyz      = None   # (x, y, z) metres — target currently being worked
         self._target_detect_t = None   # time.time() when this target was received
         self._ik_thetas       = None   # (t1, t2, t3) deg
+        self._pick_x_mm        = None   # commanded pick pose (platform frame), reused by
+        self._pick_y_mm        = None   # LIFTING to rise straight up from the same X/Y
+        self._pick_z_platform_mm = None
         self._pending_target  = None   # (x, y, z, detect_time) received while busy — PLACING
                                         # picks this up so the next pick chains immediately,
                                         # with no return-home in between.
+        self._waiting_since   = None   # time.time() when WAITING was entered, for the timeout
 
     # ── public API ─────────────────────────────────────────────────────────────
 
@@ -139,12 +165,16 @@ class PickPlaceFSM:
             return self._target_xyz
 
     def on_target(self, x: float, y: float, z: float, detect_time=None) -> bool:
-        """Accept a new target. If busy, it's buffered as the next pick (NOT
-        dropped) and picked up automatically once the current pick+place
-        cycle finishes. Returns True only if this target was started
-        immediately."""
+        """Accept a new, confirmed-reachable target. If a pick is already in
+        progress (MOVING/LIFTING), it's buffered as the next pick (NOT
+        dropped) and picked up automatically once the current pick+lift
+        cycle finishes. If WAITING (pre-positioned for an approaching weed,
+        including the WAIT-pose park right after a LIFTING release),
+        this interrupts the wait and starts the real pick immediately — that
+        wait was for exactly this moment. Returns True only if this target
+        was started immediately (from IDLE or WAITING)."""
         with self._lock:
-            if self._busy:
+            if self._busy and self._state != "WAITING":
                 self._pending_target = (
                     x, y, z, detect_time if detect_time is not None else time.time()
                 )
@@ -154,12 +184,34 @@ class PickPlaceFSM:
         self._solve_ik_and_proceed(x, y, z)
         return True
 
+    def on_approaching(self, x: float, y: float, z: float) -> None:
+        """A weed is tracked but still outside the workspace, within the
+        approach-zone band (see delta_weed_bridge). Pre-position at the fixed
+        WAIT pose to shorten the final travel once it actually arrives.
+        Only acts from IDLE — never interrupts an in-progress pick or an
+        already-active wait. x/y/z are the approaching weed's position, used
+        only for logging (the wait pose itself is fixed)."""
+        with self._lock:
+            if self._state != "IDLE":
+                return
+            self._busy = True
+            self._waiting_since = time.time()
+            self._set_state("WAITING")
+        self._log.info(
+            f"Weed approaching at ({x * 1000.0:.1f},{y * 1000.0:.1f},"
+            f"{z * 1000.0:.1f}) mm — pre-positioning to WAIT pose"
+        )
+        threading.Thread(target=self._run_wait_move, daemon=True).start()
+
     def _solve_ik_and_proceed(self, x: float, y: float, z: float) -> None:
         """Compute joint angles locally via delta_common's solve_ik_mm and
         start the move — no external solver round-trip."""
         x_mm = x * 1000.0
         y_mm = y * 1000.0
         z_platform_mm = z * 1000.0 + config.EE_OFFSET_Z_MM + Z_DROP_EXTRA_MM
+        self._pick_x_mm          = x_mm
+        self._pick_y_mm          = y_mm
+        self._pick_z_platform_mm = z_platform_mm
         ok_ik, t1, t2, t3 = solve_ik_mm(x_mm, y_mm, z_platform_mm)
         self._begin_move(t1, t2, t3, ok_ik)
 
@@ -189,6 +241,80 @@ class PickPlaceFSM:
         threading.Thread(target=self._run_move, daemon=True).start()
 
     # ── background threads ─────────────────────────────────────────────────────
+
+    def _run_wait_move(self) -> None:
+        """State WAITING: drive to the fixed pre-position pose and hold.
+        config.WAIT_X/Y/Z_MM are already platform-frame (mirrors HOME_Z's
+        convention), so no EE-tip-to-platform offset is needed before
+        solve_ik_mm, unlike a camera-detected EE-tip target."""
+        ok_ik, t1, t2, t3 = solve_ik_mm(config.WAIT_X_MM, config.WAIT_Y_MM, config.WAIT_Z_MM)
+        if not ok_ik or not self._ctrl.within_joint_limits(t1, t2, t3):
+            self._log.error(
+                f"WAIT pose ({config.WAIT_X_MM:.1f},{config.WAIT_Y_MM:.1f},"
+                f"{config.WAIT_Z_MM:.1f}) unreachable (ik_valid={ok_ik}) — aborting"
+            )
+            self._go_error()
+            return
+
+        ok, fk_xyz, err, fb_deg = self._ctrl.move_thetas(t1, t2, t3)
+        if fk_xyz is not None:
+            self._pub_fk(fk_xyz[0], fk_xyz[1], fk_xyz[2])
+        self._pub_motor_thetas(fb_deg, ok)
+
+        if not ok:
+            self._log.warn(
+                f"Move to WAIT pose did NOT settle (err={err:.2f} mm, above "
+                f"{self._ctrl.POS_TOL_MM}mm tolerance) — aborting"
+            )
+            self._go_error()
+            return
+
+        self._log.info(
+            f"At WAIT pose  FK=({fk_xyz[0]:.1f},{fk_xyz[1]:.1f},{fk_xyz[2]:.1f})"
+            f"  err={err:.2f} mm — holding for a confirmed target"
+        )
+
+    def check_waiting_timeout(self) -> None:
+        """Call periodically (node timer). If WAITING has held longer than
+        config.CONVEYOR_ARRIVAL_TIMEOUT_S with no confirmed pick, give up and
+        return home — this is an expected outcome (the weed never arrived
+        in range, e.g. lost track), not a fault, so it does NOT go through
+        ERROR."""
+        timed_out = False
+        with self._lock:
+            if self._state != "WAITING":
+                return
+            if time.time() - self._waiting_since > config.CONVEYOR_ARRIVAL_TIMEOUT_S:
+                timed_out = True
+        if timed_out:
+            self._log.info(
+                f"WAITING timeout ({config.CONVEYOR_ARRIVAL_TIMEOUT_S}s) — "
+                "no confirmed target arrived, returning home"
+            )
+            threading.Thread(target=self._return_home_from_waiting, daemon=True).start()
+
+    def _return_home_from_waiting(self) -> None:
+        """Background: drive home and land IDLE after a WAITING timeout.
+        Re-checks state==WAITING both before and after the move — a real
+        target may have arrived and taken over in the meantime (on_target()
+        interrupts WAITING directly), in which case this must not stomp on
+        the now-in-progress pick or issue a conflicting CAN command."""
+        with self._lock:
+            if self._state != "WAITING":
+                return
+        try:
+            self._ctrl.move_thetas(0.0, 0.0, 0.0)
+        except Exception as exc:
+            self._log.error(f"Home move after WAITING timeout failed: {exc}")
+        with self._lock:
+            if self._state != "WAITING":
+                return
+            self._state          = "IDLE"
+            self._busy            = False
+            self._target_xyz      = None
+            self._ik_thetas       = None
+        self._pub_state("IDLE")
+        self._log.info("[FSM] → IDLE (WAITING timeout, no weed arrived)")
 
     def _run_move(self) -> None:
         """State MOVING: drive to the IK-solved thetas, verify settle, then grip."""
@@ -285,26 +411,39 @@ class PickPlaceFSM:
                 self._pub_gripper(1.0)
 
         with self._lock:
-            self._set_state("HOMING")
-        self._run_home_and_release()
+            self._set_state("LIFTING")
+        self._run_lift_and_release()
 
-    def _run_home_and_release(self) -> None:
-        """State HOMING: no lift, no place stop — drive straight to home
-        (theta=0,0,0) with the object gripped, release there, then chain
-        straight into the next queued target or land in IDLE."""
-        ok, fk_xyz, err, fb_deg = self._ctrl.move_thetas(0.0, 0.0, 0.0)
+    def _run_lift_and_release(self) -> None:
+        """State LIFTING: no place stop — rise LIFT_AFTER_PICK_MM straight up
+        from the pick point (same X/Y, platform frame) with the object
+        gripped, release once settled there, then chain straight into the
+        next queued target or return to the WAIT pose and re-enter WAITING
+        for the next weed (never lands in plain IDLE on a normal cycle —
+        only a WAITING timeout or ERROR recovery does that)."""
+        lift_z_platform_mm = self._pick_z_platform_mm + LIFT_AFTER_PICK_MM
+        ok_ik, t1, t2, t3 = solve_ik_mm(self._pick_x_mm, self._pick_y_mm, lift_z_platform_mm)
+        if not ok_ik or not self._ctrl.within_joint_limits(t1, t2, t3):
+            self._log.error(
+                f"Lift pose ({self._pick_x_mm:.1f},{self._pick_y_mm:.1f},"
+                f"{lift_z_platform_mm:.1f}) unreachable (ik_valid={ok_ik}) — aborting"
+            )
+            self._go_error()
+            return
+
+        ok, fk_xyz, err, fb_deg = self._ctrl.move_thetas(t1, t2, t3)
         if fk_xyz is not None:
             self._pub_fk(fk_xyz[0], fk_xyz[1], fk_xyz[2])
         self._pub_motor_thetas(fb_deg, ok)
 
         if not ok:
             self._log.warn(
-                f"Home move did NOT settle (err={err:.2f} mm, above "
+                f"Lift move did NOT settle (err={err:.2f} mm, above "
                 f"{self._ctrl.POS_TOL_MM}mm tolerance) — releasing anyway"
             )
         else:
             self._log.info(
-                f"Home OK  FK=({fk_xyz[0]:.1f},{fk_xyz[1]:.1f},{fk_xyz[2]:.1f})"
+                f"Lifted  FK=({fk_xyz[0]:.1f},{fk_xyz[1]:.1f},{fk_xyz[2]:.1f})"
                 f"  err={err:.2f} mm"
             )
 
@@ -327,14 +466,13 @@ class PickPlaceFSM:
             self._solve_ik_and_proceed(x, y, z)
             return   # already moving on the next target
 
-        # Already homed above — just land the state, no second home move.
+        # No next pick queued — go straight back to the WAIT pose instead of
+        # a plain home/IDLE, since the belt keeps feeding weeds. Re-uses the
+        # same WAITING state/timeout as the approach-zone pre-position.
         with self._lock:
-            self._state          = "IDLE"
-            self._busy            = False
-            self._target_xyz      = None
-            self._ik_thetas        = None
-        self._pub_state("IDLE")
-        self._log.info("[FSM] → IDLE")
+            self._waiting_since = time.time()
+            self._set_state("WAITING")
+        self._run_wait_move()
 
     def _go_error(self) -> None:
         with self._lock:
@@ -502,6 +640,12 @@ class PickPlaceNode(Node):
             self._on_target_xyz,
             10,
         )
+        self._sub_approaching = self.create_subscription(
+            DeltaTarget,
+            "/delta/approaching_target",
+            self._on_approaching_target,
+            10,
+        )
         self._sub_depth = self.create_subscription(
             Image,
             config.DEPTH_TOPIC,
@@ -520,7 +664,7 @@ class PickPlaceNode(Node):
 
         self.get_logger().info(
             "PickPlaceNode ready\n"
-            "  Listening : /delta/target_xyz\n"
+            "  Listening : /delta/target_xyz, /delta/approaching_target\n"
             "  State     : /delta/bridge_state\n"
             "  IK solved locally — no external solver round-trip"
         )
@@ -596,6 +740,13 @@ class PickPlaceNode(Node):
                 f"Target ({x * 1000.0:.1f},{y * 1000.0:.1f},{z * 1000.0:.1f}) mm "
                 f"queued as next pick (state={self._fsm.state})"
             )
+
+    def _on_approaching_target(self, msg: DeltaTarget) -> None:
+        """A weed is tracked but still outside the workspace, within the
+        approach-zone band (delta_weed_bridge). Positions in mm already —
+        DeltaTarget doesn't need the depth-reprojection/smoothing/belt-predict
+        pipeline _on_target_xyz uses, since this isn't a pick commitment."""
+        self._fsm.on_approaching(msg.x_mm / 1000.0, msg.y_mm / 1000.0, msg.z_mm / 1000.0)
 
     def _publish_target_committed(self, x_m: float, y_m: float, z_m: float) -> None:
         """Convert EE-tip metres to platform-frame mm and publish DeltaTarget
@@ -819,10 +970,14 @@ class PickPlaceNode(Node):
         self._pub_joint_states.publish(msg)
 
     def _publish_fk_heartbeat(self) -> None:
-        """Refresh /delta/ee_fk_xyz, /delta/ee_position_mm and /joint_states from live CAN feedback."""
+        """Refresh /delta/ee_fk_xyz, /delta/ee_position_mm and /joint_states from live CAN feedback.
+        Also the WAITING-timeout tick — checked unconditionally (even in
+        dry-run/not-connected) since it's just an FSM state transition, not
+        a CAN read."""
+        self._fsm.check_waiting_timeout()
         if not config.ENABLE_MOTORS or not self._ctrl.connected:
             return
-        # _run_move/_run_home_and_release drive the same CAN bus from a background thread
+        # _run_move/_run_lift_and_release drive the same CAN bus from a background thread
         # while busy; polling here concurrently can steal its response frame
         # and leave that thread blocked forever on a CAN read with no timeout
         # (bus.read() -> receive() has none). Those paths already publish

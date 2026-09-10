@@ -2,12 +2,24 @@
 """
 merge_code_test.py — Direct-camera-pipeline variant of plant_perception_node.py.
 
-Grabs color frames straight from a UVC/V4L2 global-shutter camera via
-cv2.VideoCapture instead of subscribing to a camera-driver ROS node's topics.
-This removes the camera-driver -> DDS serialization -> subscriber hop
-entirely. The camera has no depth stream, so depth_img is always None here —
-downstream code already falls back to an invalid DepthEstimate in that case,
-and pick_place_node uses config.FAKE_DEPTH_M for Z.
+Grabs color frames straight from a UVC/V4L2 global-shutter camera via a
+GStreamer appsink pipeline instead of subscribing to a camera-driver ROS
+node's topics. This removes the camera-driver -> DDS serialization ->
+subscriber hop entirely. The camera has no depth stream, so depth_img is
+always None here — downstream code already falls back to an invalid
+DepthEstimate in that case, and pick_place_node uses config.FAKE_DEPTH_M
+for Z.
+
+2026-09-08: capture used to go through cv2.VideoCapture(..., CAP_V4L2),
+which decodes this camera's MJPG stream in software (libjpeg, on the CPU) —
+measured at 133ms/frame at 1920x1080 (7.5 FPS flat), a hard ceiling
+independent of how fast inference ran. Jetson has a dedicated hardware JPEG
+decoder exposed via GStreamer's nvv4l2decoder; routing capture through it
+(v4l2src -> nvv4l2decoder mjpeg=1 -> nvvidconv -> appsink) measured
+27.6ms/frame (~36 FPS) with the CPU almost entirely idle instead. Requires
+camera_fourcc == "MJPG" (this camera's only mode — see
+`v4l2-ctl --list-formats-ext`); there's no software-decode fallback path
+since one was never needed here.
 
 Do not run this alongside plant_perception_node.py — only one process can
 hold the camera device open at a time.
@@ -19,6 +31,9 @@ import time
 
 import numpy as np
 import cv2
+import gi
+gi.require_version("Gst", "1.0")
+from gi.repository import Gst
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
@@ -26,6 +41,8 @@ from sensor_msgs.msg import Image, CompressedImage, CameraInfo
 from cv_bridge import CvBridge
 
 from delta_common import config as delta_config
+
+Gst.init(None)
 
 try:
     from plant_perception.msg import TrackedPlant, TrackedPlantArray
@@ -36,14 +53,14 @@ except ImportError:
 
 try:
     from trt_inferencer import TRTInferencer
-    from postprocess import postprocess
+    from tiled_inference import run_tiled_inference
     from tracker import Tracker
     from track_state import TrackStateManager
     from depth_utils import estimate_root_depth, DepthEstimate
     from visualization import draw_visualizations
 except ImportError:
     from .trt_inferencer import TRTInferencer
-    from .postprocess import postprocess
+    from .tiled_inference import run_tiled_inference
     from .tracker import Tracker
     from .track_state import TrackStateManager
     from .depth_utils import estimate_root_depth, DepthEstimate
@@ -67,13 +84,32 @@ class MergeCodeTestNode(Node):
         self.get_logger().info("Initializing merge_code_test_node (direct UVC camera pipeline)...")
 
         # Model parameters
-        self.declare_parameter("model_path", "src/weight/best.engine")
+        # best_fp16.engine's content is actually the INT8 engine — the real
+        # fp16 weights are best_fp16__copy.engine, see perception_direct.yaml.
+        self.declare_parameter("model_path", "src/weight/best_fp16__copy.engine")
         self.declare_parameter("imgsz", 640)
         self.declare_parameter("conf_thres", 0.25)
         self.declare_parameter("iou_thres", 0.45)
         self.declare_parameter("device", "tensorrt")
         self.declare_parameter("target_fps", 30.0)
-        self.declare_parameter("trt_fp16_enable", False)
+        self.declare_parameter("trt_fp16_enable", True)
+
+        # Tiled inference (see tiled_inference.py) — splits a high-res frame
+        # into overlapping tiles run through the model individually instead
+        # of one full-frame downscale, so small/distant weeds keep more
+        # detail. 1088/96 -> 2 tiles at 1920x1080 instead of 6 (see
+        # tiled_inference.py / perception_direct.yaml for the full story).
+        self.declare_parameter("tile_size", 1088)
+        self.declare_parameter("tile_overlap", 96)
+
+        # Vertical center-crop applied to every captured frame BEFORE
+        # anything else touches it (inference, visualization, publish) — see
+        # frame_crop_height below and ~/yolo_bench_ws/yolo_test_fp16_high.py,
+        # which this mirrors: 1280x720 capture, center-cropped to 640 tall so
+        # tile_size=640/tile_overlap=0 splits the frame into exactly two
+        # 640x640 tiles with zero letterbox resize on either axis. 0 disables
+        # cropping (frame used as captured).
+        self.declare_parameter("frame_crop_height", 0)
 
         # Tracker parameters
         self.declare_parameter("tracker_type", "bytetrack")
@@ -109,6 +145,17 @@ class MergeCodeTestNode(Node):
         self.declare_parameter("enable_visualization", True)
         self.declare_parameter("visualization_show_masks", False)
         self.declare_parameter("visualization_jpeg_quality", 80)
+        # 2026-09-08: a subscribed debug viewer used to draw+encode+publish
+        # inline in process_frame, on the same thread as inference/tracking
+        # -> tracked_plants (the topic pick_place_node actually acts on)
+        # dropped to whatever rate the viewer could keep up with (measured
+        # ~5.8-9.7 FPS with a viewer attached vs ~22 FPS with none). Moved
+        # to its own thread below (_visualization_loop) so a debug viewer
+        # can never throttle robot-control-relevant output again.
+        # visualization_max_width also downscales the annotated frame before
+        # encode/publish — cv2.imencode of a full 1920x1080 frame measured
+        # 28.3ms, vs 6.0ms at 960x540 — 0 disables downscaling.
+        self.declare_parameter("visualization_max_width", 960)
 
         # Direct camera parameters (replaces color/depth topic parameters)
         self.declare_parameter("camera_width", 640)
@@ -142,6 +189,9 @@ class MergeCodeTestNode(Node):
         self.device = str(self.get_parameter("device").value)
         self.target_fps = float(self.get_parameter("target_fps").value)
         self.trt_fp16_enable = bool(self.get_parameter("trt_fp16_enable").value)
+        self.tile_size = int(self.get_parameter("tile_size").value)
+        self.tile_overlap = int(self.get_parameter("tile_overlap").value)
+        self.frame_crop_height = int(self.get_parameter("frame_crop_height").value)
 
         self.tracker_type = str(self.get_parameter("tracker_type").value)
         self.track_high_thresh = float(self.get_parameter("track_high_thresh").value)
@@ -174,10 +224,17 @@ class MergeCodeTestNode(Node):
         self.enable_visualization = bool(self.get_parameter("enable_visualization").value)
         self.visualization_show_masks = bool(self.get_parameter("visualization_show_masks").value)
         self.visualization_jpeg_quality = int(self.get_parameter("visualization_jpeg_quality").value)
+        self.visualization_max_width = int(self.get_parameter("visualization_max_width").value)
 
         self.camera_width = int(self.get_parameter("camera_width").value)
         self.camera_height = int(self.get_parameter("camera_height").value)
         self.camera_fps = int(self.get_parameter("camera_fps").value)
+        if self.frame_crop_height > 0 and self.frame_crop_height < self.camera_height:
+            self.crop_top = (self.camera_height - self.frame_crop_height) // 2
+            self.cropped_height = self.frame_crop_height
+        else:
+            self.crop_top = 0
+            self.cropped_height = self.camera_height
         self.camera_device = str(self.get_parameter("camera_device").value)
         self.camera_fourcc = str(self.get_parameter("camera_fourcc").value)
         self.camera_fx = float(self.get_parameter("camera_fx").value)
@@ -268,33 +325,43 @@ class MergeCodeTestNode(Node):
             )
         self.depth_scale = None
 
-        self.cap = cv2.VideoCapture(self.camera_device, cv2.CAP_V4L2)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Could not open camera device {self.camera_device!r}")
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*self.camera_fourcc))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.camera_width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.camera_height)
-        self.cap.set(cv2.CAP_PROP_FPS, self.camera_fps)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # minimize latency, always grab the newest frame
+        if self.camera_fourcc != "MJPG":
+            raise RuntimeError(
+                f"camera_fourcc={self.camera_fourcc!r} not supported — the hardware-decode "
+                "GStreamer capture path only handles this camera's MJPG mode. Add a "
+                "software-decode (cv2.VideoCapture) fallback here if a non-MJPG camera "
+                "is ever used."
+            )
 
-        actual_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or self.camera_width
-        actual_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or self.camera_height
+        self._gst_pipeline, self._gst_sink = self._open_camera_gst()
+        actual_w, actual_h = self.camera_width, self.cropped_height
+        crop_note = (
+            f", center-cropped {self.camera_height}->{self.cropped_height} (rows "
+            f"{self.crop_top}:{self.crop_top + self.cropped_height})"
+            if self.crop_top > 0 else ""
+        )
         self.get_logger().info(
-            f"UVC camera opened directly: {self.camera_device} requested "
-            f"{self.camera_width}x{self.camera_height}@{self.camera_fps}fps "
-            f"({self.camera_fourcc}), got {actual_w}x{actual_h}"
+            f"UVC camera opened via GStreamer hardware JPEG decode: {self.camera_device} "
+            f"{self.camera_width}x{self.camera_height}@{self.camera_fps}fps ({self.camera_fourcc})"
+            f"{crop_note}"
         )
         self._camera_info_msg = self._build_camera_info_msg(actual_w, actual_h)
 
-        # Capture (camera I/O) and processing (inference/tracking/publish) run on
-        # separate threads so a slow GPU frame can never delay grabbing the next
-        # camera frame, and vice versa.
+        # Capture (camera I/O), processing (inference/tracking/publish), and
+        # visualization (draw/encode/publish for a debug viewer) each run on
+        # their own thread so a slow stage can never delay the others — in
+        # particular, a debug viewer subscribed to the visualization topic
+        # must never throttle tracked_plants, the topic pick_place_node
+        # actually acts on.
         self._frame_queue = queue.Queue(maxsize=1)
+        self._vis_queue = queue.Queue(maxsize=1)
         self._stop_event = threading.Event()
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._vis_thread = threading.Thread(target=self._visualization_loop, daemon=True)
         self._capture_thread.start()
         self._worker_thread.start()
+        self._vis_thread.start()
 
         self.timer_diag = self.create_timer(5.0, self._check_heartbeat)
         self.get_logger().info("merge_code_test_node startup complete.")
@@ -302,13 +369,81 @@ class MergeCodeTestNode(Node):
     # ------------------------------------------------------------------
     # Direct camera capture
     # ------------------------------------------------------------------
+    def _open_camera_gst(self):
+        """Build and start a GStreamer pipeline that decodes this camera's
+        MJPG stream on Jetson's dedicated hardware JPEG decoder
+        (nvv4l2decoder) instead of the CPU, then converts to a plain BGR
+        appsink so the rest of this file keeps working with numpy arrays.
+        See the module docstring for the measured 7.5 FPS -> ~36 FPS why."""
+        pipeline_str = (
+            f"v4l2src device={self.camera_device} ! "
+            f"image/jpeg,width={self.camera_width},height={self.camera_height},"
+            f"framerate={self.camera_fps}/1 ! "
+            "nvv4l2decoder mjpeg=1 ! "
+            "nvvidconv ! video/x-raw,format=BGRx ! "
+            "videoconvert ! video/x-raw,format=BGR ! "
+            "appsink name=sink emit-signals=false max-buffers=1 drop=true sync=false"
+        )
+        pipeline = Gst.parse_launch(pipeline_str)
+        sink = pipeline.get_by_name("sink")
+        ret = pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            raise RuntimeError(
+                f"Could not start GStreamer capture pipeline for {self.camera_device!r} "
+                f"at {self.camera_width}x{self.camera_height}@{self.camera_fps}fps"
+            )
+
+        # set_state(PLAYING) above only requests the transition — for a live
+        # source it returns ASYNC immediately, well before nvv4l2decoder's
+        # hardware block actually finishes init. Block here until the
+        # pipeline confirms PLAYING (or the bus reports why it didn't), so
+        # _capture_loop never starts pulling during that window — appsink's
+        # pull-sample returns None with no error while the sink is still in
+        # READY, which otherwise shows up as a burst of spurious "frame grab
+        # failed" warnings on every startup.
+        state_ret, state, _ = pipeline.get_state(10 * Gst.SECOND)
+        if state_ret != Gst.StateChangeReturn.SUCCESS or state != Gst.State.PLAYING:
+            bus = pipeline.get_bus()
+            msg = bus.pop_filtered(Gst.MessageType.ERROR | Gst.MessageType.WARNING)
+            detail = []
+            while msg:
+                if msg.type == Gst.MessageType.ERROR:
+                    err, debug = msg.parse_error()
+                else:
+                    err, debug = msg.parse_warning()
+                detail.append(f"{err} ({debug})")
+                msg = bus.pop_filtered(Gst.MessageType.ERROR | Gst.MessageType.WARNING)
+            pipeline.set_state(Gst.State.NULL)
+            raise RuntimeError(
+                f"GStreamer capture pipeline for {self.camera_device!r} at "
+                f"{self.camera_width}x{self.camera_height}@{self.camera_fps}fps never "
+                f"reached PLAYING (state={state.value_nick}): " + ("; ".join(detail) or "no bus error reported")
+            )
+        return pipeline, sink
+
     def _capture_loop(self):
         while not self._stop_event.is_set() and rclpy.ok():
-            ok, cv_img = self.cap.read()
-            if not ok or cv_img is None:
+            sample = self._gst_sink.emit("pull-sample")
+            if sample is None:
                 self.get_logger().warn("UVC camera frame grab failed, retrying...")
                 time.sleep(0.01)
                 continue
+
+            buf = sample.get_buffer()
+            caps = sample.get_caps().get_structure(0)
+            w = caps.get_value("width")
+            h = caps.get_value("height")
+            ok, mapinfo = buf.map(Gst.MapFlags.READ)
+            if not ok:
+                self.get_logger().warn("UVC camera frame buffer map failed, retrying...")
+                continue
+            try:
+                cv_img = np.frombuffer(mapinfo.data, dtype=np.uint8).reshape(h, w, 3).copy()
+            finally:
+                buf.unmap(mapinfo)
+
+            if self.crop_top > 0:
+                cv_img = cv_img[self.crop_top:self.crop_top + self.cropped_height, :]
 
             self.last_capture_time = time.time()
             self._enqueue_frame(cv_img, None)
@@ -337,6 +472,71 @@ class MergeCodeTestNode(Node):
             except Exception as e:
                 self.get_logger().error(f"Worker frame processing failed: {e}")
 
+    def _visualization_loop(self):
+        """Draw/encode/publish the debug visualization AND the raw color
+        feed on their own thread — see the visualization_max_width and
+        color_needed comments in process_frame for why both are split out
+        of the critical inference/tracking/tracked_plants path."""
+        while not self._stop_event.is_set() and rclpy.ok():
+            try:
+                cv_img, active_states, fps, inference_ms, header, viz_needed, color_needed = (
+                    self._vis_queue.get(timeout=1.0)
+                )
+            except queue.Empty:
+                continue
+
+            if color_needed and self.pub_color.get_subscription_count() > 0:
+                try:
+                    # passthrough + explicit encoding sidesteps a cv_bridge/opencv-python
+                    # ABI mismatch in this environment (see pub_visualization below).
+                    color_msg = self.bridge.cv2_to_imgmsg(cv_img, encoding="passthrough")
+                    color_msg.encoding = "bgr8"
+                    color_msg.header = header
+                    self.pub_color.publish(color_msg)
+                except Exception as e:
+                    self.get_logger().error(f"Color image publishing failed: {e}")
+
+            if not viz_needed:
+                continue
+
+            try:
+                annotated_img = draw_visualizations(
+                    img_bgr=cv_img,
+                    detections=active_states,
+                    show_boxes=True,
+                    show_masks=(self.publish_masks and self.visualization_show_masks),
+                    show_roots=True,
+                    fps=fps,
+                    latency_ms=inference_ms,
+                    device=self.device,
+                )
+
+                if self.visualization_max_width > 0 and annotated_img.shape[1] > self.visualization_max_width:
+                    vh, vw = annotated_img.shape[:2]
+                    new_w = self.visualization_max_width
+                    new_h = int(round(vh * (new_w / vw)))
+                    annotated_img = cv2.resize(annotated_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+                if self.pub_visualization.get_subscription_count() > 0:
+                    # passthrough + explicit encoding sidesteps a cv_bridge/opencv-python
+                    # ABI mismatch in this environment (see plant_perception_node.py).
+                    vis_msg = self.bridge.cv2_to_imgmsg(annotated_img, encoding="passthrough")
+                    vis_msg.encoding = "bgr8"
+                    vis_msg.header = header
+                    self.pub_visualization.publish(vis_msg)
+
+                if self.pub_visualization_compressed.get_subscription_count() > 0:
+                    compressed_msg = CompressedImage()
+                    compressed_msg.header = header
+                    compressed_msg.format = "jpeg"
+                    quality = [int(cv2.IMWRITE_JPEG_QUALITY), self.visualization_jpeg_quality]
+                    ret, jpeg_data = cv2.imencode(".jpg", annotated_img, quality)
+                    if ret:
+                        compressed_msg.data = jpeg_data.tobytes()
+                        self.pub_visualization_compressed.publish(compressed_msg)
+            except Exception as e:
+                self.get_logger().error(f"Visualization publishing failed: {e}")
+
     # ------------------------------------------------------------------
     # Processing pipeline (mirrors PlantPerceptionNode.sync_callback, adapted
     # for numpy frames straight from cv2.VideoCapture instead of ROS Image msgs)
@@ -356,45 +556,39 @@ class MergeCodeTestNode(Node):
         fps = ((len(self.frame_times) - 1) / (self.frame_times[-1] - self.frame_times[0])
                if len(self.frame_times) > 1 else 0.0)
 
-        h_orig, w_orig = cv_img.shape[:2]
         header = self._make_header()
 
         if self._camera_info_msg is not None:
             self._camera_info_msg.header = header
             self.pub_camera_info.publish(self._camera_info_msg)
 
-        if self.pub_color.get_subscription_count() > 0:
-            try:
-                # passthrough + explicit encoding sidesteps a cv_bridge/opencv-python
-                # ABI mismatch in this environment (see pub_visualization below).
-                color_msg = self.bridge.cv2_to_imgmsg(cv_img, encoding="passthrough")
-                color_msg.encoding = "bgr8"
-                color_msg.header = header
-                self.pub_color.publish(color_msg)
-            except Exception as e:
-                self.get_logger().error(f"Color image publishing failed: {e}")
+        # pub_color's publish used to happen inline right here — cheap when nothing
+        # subscribes to color_image_topic, but weed_bridge_node's own "Delta Camera"
+        # window does (config.VIEW_IMAGE=True by default), and at that point this was
+        # a full 1920x1080 bgr8 cv2_to_imgmsg + publish on every accepted frame, on
+        # the same thread as inference/tracking/tracked_plants — the exact bug already
+        # fixed for the annotated visualization output below, just missed here because
+        # nothing subscribed to color_image_topic in isolated testing. Now handed to
+        # _visualization_loop along with the rest of the per-frame publish work; see
+        # its "colour" fields below.
+        color_needed = self.pub_color.get_subscription_count() > 0
 
-        # 1. TensorRT inference
+        # 1+2. Tiled inference + per-tile post-processing, merged (tiled_inference.py)
         try:
-            onnx_outputs, ratio, pad, inference_ms = self.inferencer.run(cv_img)
-        except Exception as e:
-            self.get_logger().error(f"Inference failed: {e}")
-            return
-
-        # 2. Post-processing (optional segmentation)
-        try:
-            detections = postprocess(
-                onnx_outputs=onnx_outputs,
-                orig_shape=(h_orig, w_orig),
-                input_shape=(self.imgsz, self.imgsz),
+            detections, inference_ms, n_tiles = run_tiled_inference(
+                self.inferencer,
+                cv_img,
+                imgsz=self.imgsz,
                 conf_thres=self.conf_thres,
                 iou_thres=self.iou_thres,
                 num_classes=4,
                 class_names=CLASS_NAMES,
                 decode_segmentation=self.publish_masks,
+                tile_size=self.tile_size,
+                tile_overlap=self.tile_overlap,
             )
         except Exception as e:
-            self.get_logger().error(f"Post-processing failed: {e}")
+            self.get_logger().error(f"Tiled inference failed: {e}")
             return
 
         # 3. ByteTrack update (runs even if detections is empty)
@@ -493,43 +687,23 @@ class MergeCodeTestNode(Node):
             except Exception as e:
                 self.get_logger().error(f"Failed to publish TrackedPlantArray: {e}")
 
-        # 8. Optional visualization
+        # 8. Optional visualization + raw color publish — both handed off to
+        # _visualization_loop (its own thread) so neither a debug viewer nor
+        # another node subscribed to the raw color feed (e.g. weed_bridge_node's
+        # EE-marker detector) can throttle this method's own rate.
+        viz_needed = False
         if self.enable_visualization:
             sub_raw_count = self.pub_visualization.get_subscription_count()
             sub_comp_count = self.pub_visualization_compressed.get_subscription_count()
+            viz_needed = sub_raw_count > 0 or sub_comp_count > 0
 
-            if sub_raw_count > 0 or sub_comp_count > 0:
-                try:
-                    annotated_img = draw_visualizations(
-                        img_bgr=cv_img,
-                        detections=active_states,
-                        show_boxes=True,
-                        show_masks=(self.publish_masks and self.visualization_show_masks),
-                        show_roots=True,
-                        fps=fps,
-                        latency_ms=inference_ms,
-                        device=self.device,
-                    )
-
-                    if sub_raw_count > 0:
-                        # passthrough + explicit encoding sidesteps a cv_bridge/opencv-python
-                        # ABI mismatch in this environment (see plant_perception_node.py).
-                        vis_msg = self.bridge.cv2_to_imgmsg(annotated_img, encoding="passthrough")
-                        vis_msg.encoding = "bgr8"
-                        vis_msg.header = header
-                        self.pub_visualization.publish(vis_msg)
-
-                    if sub_comp_count > 0:
-                        compressed_msg = CompressedImage()
-                        compressed_msg.header = header
-                        compressed_msg.format = "jpeg"
-                        quality = [int(cv2.IMWRITE_JPEG_QUALITY), self.visualization_jpeg_quality]
-                        ret, jpeg_data = cv2.imencode(".jpg", annotated_img, quality)
-                        if ret:
-                            compressed_msg.data = jpeg_data.tobytes()
-                            self.pub_visualization_compressed.publish(compressed_msg)
-                except Exception as e:
-                    self.get_logger().error(f"Visualization publishing failed: {e}")
+        if viz_needed or color_needed:
+            try:
+                self._vis_queue.put_nowait(
+                    (cv_img, active_states, fps, inference_ms, header, viz_needed, color_needed)
+                )
+            except queue.Full:
+                pass  # visualization thread is behind — drop this frame's viz/color, not a real one
 
     def _make_header(self):
         from std_msgs.msg import Header
@@ -548,21 +722,30 @@ class MergeCodeTestNode(Node):
         intrinsics — camera_fx/fy/cx/cy default to a rough placeholder and
         MUST be overridden with values from a real chessboard calibration
         of this camera/lens for accurate pixel_to_camera_xyz_mm() results.
+
+        width/height here are the POST-crop dimensions actually published
+        (see frame_crop_height) — camera_cy is shifted by crop_top to match,
+        since the vertical crop moves the frame's own origin down by that
+        many rows. camera_fx/fy/cx/cy themselves are still whatever
+        resolution they were calibrated at (see camera_fx's own parameter
+        comment) — this shift does NOT re-derive them for a different
+        capture resolution.
         """
         msg = CameraInfo()
         msg.width = width
         msg.height = height
         msg.distortion_model = "plumb_bob"
         msg.d = list(self.camera_dist)
+        cy = self.camera_cy - self.crop_top
         msg.k = [
             self.camera_fx, 0.0, self.camera_cx,
-            0.0, self.camera_fy, self.camera_cy,
+            0.0, self.camera_fy, cy,
             0.0, 0.0, 1.0,
         ]
         msg.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
         msg.p = [
             self.camera_fx, 0.0, self.camera_cx, 0.0,
-            0.0, self.camera_fy, self.camera_cy, 0.0,
+            0.0, self.camera_fy, cy, 0.0,
             0.0, 0.0, 1.0, 0.0,
         ]
         return msg
@@ -621,7 +804,7 @@ class MergeCodeTestNode(Node):
     def destroy_node(self):
         self._stop_event.set()
         try:
-            self.cap.release()
+            self._gst_pipeline.set_state(Gst.State.NULL)
         except Exception:
             pass
         super().destroy_node()

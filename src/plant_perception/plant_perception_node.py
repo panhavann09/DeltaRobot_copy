@@ -14,6 +14,8 @@ from cv_bridge import CvBridge
 import message_filters
 import cv2
 
+from delta_common import config as delta_config
+
 try:
     from plant_perception.msg import TrackedPlant, TrackedPlantArray
 except ImportError:
@@ -23,7 +25,7 @@ except ImportError:
 
 try:
     from trt_inferencer import TRTInferencer
-    from postprocess import postprocess
+    from tiled_inference import run_tiled_inference
     from tracker import Tracker
     from track_state import TrackStateManager, PlantTrackState
     from depth_utils import estimate_root_depth, DepthEstimate
@@ -31,14 +33,14 @@ try:
 except ImportError:
     try:
         from .trt_inferencer import TRTInferencer
-        from .postprocess import postprocess
+        from .tiled_inference import run_tiled_inference
         from .tracker import Tracker
         from .track_state import TrackStateManager, PlantTrackState
         from .depth_utils import estimate_root_depth, DepthEstimate
         from .visualization import draw_visualizations
     except ImportError:
         from .onnx_inferencer import ONNXInferencer as TRTInferencer
-        from .postprocess import postprocess
+        from .tiled_inference import run_tiled_inference
         from .tracker import Tracker
         from .track_state import TrackStateManager, PlantTrackState
         from .depth_utils import estimate_root_depth, DepthEstimate
@@ -57,16 +59,24 @@ class PlantPerceptionNode(Node):
 
     def __init__(self):
         super().__init__("plant_perception_node")
-        self.get_logger().info("Initializing plant_perception_node (TensorRT 32 FP32)...")
+        self.get_logger().info("Initializing plant_perception_node (TensorRT)...")
 
         # Model parameters
-        self.declare_parameter("model_path", "src/weight/best.engine")
+        self.declare_parameter("model_path", "src/weight/best_fp16.engine")
         self.declare_parameter("imgsz", 640)
         self.declare_parameter("conf_thres", 0.25)
         self.declare_parameter("iou_thres", 0.45)
         self.declare_parameter("device", "tensorrt")
         self.declare_parameter("target_fps", 30.0)
-        self.declare_parameter("trt_fp16_enable", False)
+        self.declare_parameter("trt_fp16_enable", True)
+
+        # Tiled inference (see tiled_inference.py) — splits a high-res frame
+        # into overlapping tiles run through the model individually instead
+        # of one full-frame downscale, so small/distant weeds keep more
+        # detail. 1088/96 -> 2 tiles at 1920x1080 instead of 6 (see
+        # tiled_inference.py / perception.yaml for the full story).
+        self.declare_parameter("tile_size", 1088)
+        self.declare_parameter("tile_overlap", 96)
 
         # Tracker parameters
         self.declare_parameter("tracker_type", "bytetrack")
@@ -111,6 +121,14 @@ class PlantPerceptionNode(Node):
         self.declare_parameter("enable_visualization", True)
         self.declare_parameter("visualization_show_masks", False)
         self.declare_parameter("visualization_jpeg_quality", 80)
+        # Downscales the annotated frame before encode/publish — see
+        # merge_code_test.py's visualization_max_width comment: cv2.imencode
+        # of a full 1920x1080 frame measured 28.3ms vs 6.0ms at 960x540.
+        # 0 disables downscaling. Unlike merge_code_test.py's dedicated
+        # visualization thread, this stays inline in sync_callback — this
+        # node is driven by rclpy's subscriber callback, not a capture loop,
+        # so decoupling it needs a bigger restructure than this pass covers.
+        self.declare_parameter("visualization_max_width", 960)
 
         # Retrieve and cache parameters
         self.model_path = self._resolve_model_path(self.get_parameter("model_path").value)
@@ -120,6 +138,8 @@ class PlantPerceptionNode(Node):
         self.device = str(self.get_parameter("device").value)
         self.target_fps = float(self.get_parameter("target_fps").value)
         self.trt_fp16_enable = bool(self.get_parameter("trt_fp16_enable").value)
+        self.tile_size = int(self.get_parameter("tile_size").value)
+        self.tile_overlap = int(self.get_parameter("tile_overlap").value)
 
         self.tracker_type = str(self.get_parameter("tracker_type").value)
         self.track_high_thresh = float(self.get_parameter("track_high_thresh").value)
@@ -162,6 +182,7 @@ class PlantPerceptionNode(Node):
         self.enable_visualization = bool(self.get_parameter("enable_visualization").value)
         self.visualization_show_masks = bool(self.get_parameter("visualization_show_masks").value)
         self.visualization_jpeg_quality = int(self.get_parameter("visualization_jpeg_quality").value)
+        self.visualization_max_width = int(self.get_parameter("visualization_max_width").value)
 
         # Core modules
         self.bridge = CvBridge()
@@ -188,6 +209,7 @@ class PlantPerceptionNode(Node):
             root_ema_alpha=self.root_ema_alpha,
             class_history_size=self.class_history_size,
             depth_history_size=self.depth_history_size,
+            require_depth=not delta_config.FAKE_DEPTH_ENABLE,
         )
 
         # Publishers
@@ -267,29 +289,22 @@ class PlantPerceptionNode(Node):
             self.get_logger().warn(f"Image conversion failed: {e}")
             return
 
-        h_orig, w_orig = cv_img.shape[:2]
-
-        # 2. ONNX inference
+        # 2+3. Tiled inference + per-tile post-processing, merged (tiled_inference.py)
         try:
-            onnx_outputs, ratio, pad, inference_ms = self.inferencer.run(cv_img)
-        except Exception as e:
-            self.get_logger().error(f"Inference failed: {e}")
-            return
-
-        # 3. Post-processing (Optional segmentation)
-        try:
-            detections = postprocess(
-                onnx_outputs=onnx_outputs,
-                orig_shape=(h_orig, w_orig),
-                input_shape=(self.imgsz, self.imgsz),
+            detections, inference_ms, n_tiles = run_tiled_inference(
+                self.inferencer,
+                cv_img,
+                imgsz=self.imgsz,
                 conf_thres=self.conf_thres,
                 iou_thres=self.iou_thres,
                 num_classes=4,
                 class_names=CLASS_NAMES,
                 decode_segmentation=self.publish_masks,
+                tile_size=self.tile_size,
+                tile_overlap=self.tile_overlap,
             )
         except Exception as e:
-            self.get_logger().error(f"Post-processing failed: {e}")
+            self.get_logger().error(f"Tiled inference failed: {e}")
             return
 
         # 4. ByteTrack update (Runs even if detections is empty)
@@ -408,6 +423,12 @@ class PlantPerceptionNode(Node):
                         latency_ms=inference_ms,
                         device=self.device,
                     )
+
+                    if self.visualization_max_width > 0 and annotated_img.shape[1] > self.visualization_max_width:
+                        vh, vw = annotated_img.shape[:2]
+                        new_w = self.visualization_max_width
+                        new_h = int(round(vh * (new_w / vw)))
+                        annotated_img = cv2.resize(annotated_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
                     if sub_raw_count > 0:
                         vis_msg = self.bridge.cv2_to_imgmsg(annotated_img, encoding="bgr8")

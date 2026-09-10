@@ -16,6 +16,7 @@
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>std_srvs</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>custom_messages</exec_depend>
   <exec_depend>delta_common</exec_depend>
   <exec_depend>plant_perception</exec_depend>
 

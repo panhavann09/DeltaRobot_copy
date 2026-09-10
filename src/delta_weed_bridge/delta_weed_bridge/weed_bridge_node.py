@@ -41,6 +41,7 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from cv_bridge import CvBridge
 
+from custom_messages.msg import DeltaTarget
 from delta_common import config, camera_geometry, workspace_overlay
 from delta_common.ee_marker import EEMarkerDetector
 
@@ -80,11 +81,21 @@ class WeedBridgeNode(Node):
         self._ee_marker = EEMarkerDetector()
         self._ee_fk_pixel = None
         self._last_ee_uv = None
+        # Throttle gates for _on_color_image/_on_visualization — see
+        # config.DISPLAY_MAX_FPS for why (EE-marker detection + cv2.imshow
+        # were running on every plant_perception frame, ~20+ FPS, dragging
+        # tracked_plants down to ~10.3 FPS system-wide via CPU contention).
+        self._last_color_proc_time = 0.0
+        self._last_display_time = 0.0
 
         self._pub_target = self.create_publisher(PointStamped, "/delta/target_xyz", 10)
         self._pub_velocity = self.create_publisher(PointStamped, "/delta/object_velocity_mm_s", 10)
         self._pub_status = self.create_publisher(String, "/delta/detection_status", 10)
         self._pub_all_targets = self.create_publisher(PoseArray, "/delta/all_targets", 10)
+        # Weed spotted approaching but still outside the workspace — lets
+        # pick_place_node pre-position near the entry edge (WAITING state)
+        # ahead of the real pick. Only fires while nothing is `allowed` yet.
+        self._pub_approaching = self.create_publisher(DeltaTarget, "/delta/approaching_target", 10)
 
         self.create_subscription(CameraInfo, config.CAMERA_INFO_TOPIC, self._on_camera_info, 1)
         if TrackedPlantArray is not None:
@@ -142,7 +153,18 @@ class WeedBridgeNode(Node):
     def _on_color_image(self, msg: Image) -> None:
         """Raw feed — EE laser-marker detection only (needs clean pixel colors,
         not plant_perception's already-annotated frame). Not displayed itself;
-        _on_visualization draws the result onto the display frame."""
+        _on_visualization draws the result onto the display frame.
+
+        Throttled to config.DISPLAY_MAX_FPS — see that constant's comment.
+        _last_ee_uv only feeds the display and /delta/calibrate_cam_offset
+        sampling, neither of which needs every frame at plant_perception's
+        full rate; _on_tracked_plants (the actual weed-targeting math) never
+        reads it."""
+        now = time.time()
+        if now - self._last_color_proc_time < (1.0 / config.DISPLAY_MAX_FPS):
+            return
+        self._last_color_proc_time = now
+
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except Exception as e:
@@ -168,7 +190,16 @@ class WeedBridgeNode(Node):
     def _on_visualization(self, msg: Image) -> None:
         """Delta Camera window — workspace/conveyor zones + EE marker drawn on
         top of plant_perception's own annotated frame (weed boxes/track_id/
-        roots + its own FPS/latency HUD already burned in)."""
+        roots + its own FPS/latency HUD already burned in).
+
+        Throttled to config.DISPLAY_MAX_FPS — cv2.imshow/waitKey measured
+        ~38ms/frame in isolation; nothing needs a live window to redraw
+        faster than a human can watch it. See that constant's comment."""
+        now = time.time()
+        if now - self._last_display_time < (1.0 / config.DISPLAY_MAX_FPS):
+            return
+        self._last_display_time = now
+
         try:
             annotated = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except Exception as e:
@@ -334,6 +365,7 @@ class WeedBridgeNode(Node):
             self._pub_status.publish(status_msg)
 
         if not allowed:
+            self._publish_approaching(candidates)
             return
 
         best = min(allowed, key=lambda c: c["z_base"])
@@ -366,6 +398,33 @@ class WeedBridgeNode(Node):
             p.position.z = c["z_base"] / 1000.0
             pa.poses.append(p)
         self._pub_all_targets.publish(pa)
+
+    def _publish_approaching(self, candidates) -> None:
+        """Publish the nearest weed that's tracked but still outside the
+        workspace, if it's within APPROACH_ZONE_MARGIN_MM of the entry edge
+        (belt moves in -X, so weeds arrive from +X) — lets pick_place_node
+        pre-position at WAIT_X/Y/Z_MM ahead of the real pick. Only called
+        when nothing is `allowed` yet (see _publish above)."""
+        approaching = [
+            c for c in candidates
+            if c["reason"] == "OUTSIDE_WORKSPACE"
+            and config.X_LIMIT < c["x_base"] <= config.X_LIMIT + config.APPROACH_ZONE_MARGIN_MM
+            and abs(c["y_base"]) <= config.Y_LIMIT
+        ]
+        if not approaching:
+            return
+
+        nearest = min(approaching, key=lambda c: c["x_base"])
+        out = DeltaTarget()
+        out.header.stamp = self.get_clock().now().to_msg()
+        out.header.frame_id = "robot_base"
+        out.x_mm = nearest["x_base"]
+        out.y_mm = nearest["y_base"]
+        out.z_mm = nearest["z_base"]
+        out.confidence = -1.0
+        out.track_id = int(nearest["track_id"])
+        out.detection_mode = "weed_seg"
+        self._pub_approaching.publish(out)
 
     def destroy_node(self):
         if self.view_image:

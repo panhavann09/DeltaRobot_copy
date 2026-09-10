@@ -22,7 +22,7 @@ class UvcCameraPublisher(Node):
     def __init__(self):
         super().__init__('uvc_camera_publisher')
 
-        self.declare_parameter('camera_device', '/dev/video0')
+        self.declare_parameter('camera_device', '/dev/video1')
         self.declare_parameter('camera_fourcc', 'MJPG')
         self.declare_parameter('camera_width', 640)
         self.declare_parameter('camera_height', 480)

@@ -23,8 +23,10 @@ install(
   PROGRAMS
   plant_perception_node.py
   merge_code_test.py
+  model_test_node.py
   trt_inferencer.py
   postprocess.py
+  tiled_inference.py
   tracker.py
   track_state.py
   depth_utils.py

@@ -20,13 +20,17 @@ from delta_common import config
 
 
 def draw_conveyor_zones(annotated, frame_w: int, frame_h: int, project_fn):
-    """Overlay three zones projected from robot base frame onto the camera image.
+    """Overlay the exit zone projected from robot base frame onto the camera image.
 
     Zone layout (robot front = +X of robot base; conveyor moves objects
     in the -X direction of robot base):
-      APPROACH (amber) — object visible but not yet in robot reach (x > +X_LIMIT)
-      WORKSPACE (green) — robot can pick here (|x|,|y| within ±X_LIMIT/Y_LIMIT)
+      APPROACH (amber) — object visible but not yet in robot reach (x > +X_LIMIT) — not drawn
+      WORKSPACE (green) — robot can pick here (|x|,|y| within ±X_LIMIT/Y_LIMIT) — not drawn
       EXIT (red) — object has passed workspace (x < -X_LIMIT)
+
+    Only the EXIT zone is drawn; APPROACH and WORKSPACE fills/borders were
+    removed from the overlay, but the workspace polygon is still computed
+    and returned since callers use it as an EE-marker search-bounds filter.
 
     project_fn(x_b, y_b, z_b) -> (u, v) or None — e.g.
     delta_common.camera_geometry.project_base_to_pixel bound to fx/fy/cx/cy/T_base_to_cam.
@@ -65,30 +69,26 @@ def draw_conveyor_zones(annotated, frame_w: int, frame_h: int, project_fn):
     overlay = annotated.copy()
 
     # ── fill zones ────────────────────────────────────────────────────────
+    # ws_poly is still computed (and returned) for the EE-marker search-bounds
+    # filter — only the approach (amber) and workspace (green) fill/border are
+    # no longer drawn.
     ws_poly = np.array([list(el), list(er), list(xr), list(xl)], dtype=np.int32)
     centroid = (
         (el[0] + er[0] + xl[0] + xr[0]) / 4.0,
         (el[1] + er[1] + xl[1] + xr[1]) / 4.0,
     )
 
-    # Approach/exit edges are extended outward (away from the workspace
-    # center) until well past the frame — cv2.fillPoly clips to the
-    # canvas automatically. This makes the fill direction follow
-    # whatever way entry/exit actually project (top/bottom, left/right,
-    # or diagonal), instead of assuming a fixed vertical camera mount.
-    ap_poly = _extend_zone_poly(el, er, centroid, frame_w, frame_h)
-    cv2.fillPoly(overlay, [ap_poly], (0, 160, 255))          # amber
-
-    cv2.fillPoly(overlay, [ws_poly], (0, 200, 60))           # green
-
+    # Exit edge is extended outward (away from the workspace center) until
+    # well past the frame — cv2.fillPoly clips to the canvas automatically.
+    # This makes the fill direction follow whatever way exit actually
+    # projects (top/bottom, left/right, or diagonal), instead of assuming
+    # a fixed vertical camera mount.
     ex_poly = _extend_zone_poly(xl, xr, centroid, frame_w, frame_h)
     cv2.fillPoly(overlay, [ex_poly], (60, 60, 200))          # red
 
     cv2.addWeighted(overlay, 0.20, annotated, 0.80, 0.0, annotated)
 
     # ── border lines ──────────────────────────────────────────────────────
-    cv2.polylines(annotated, [ws_poly], True, (0, 255, 60), 2)
-    cv2.line(annotated, tuple(el), tuple(er), (0, 160, 255), 2)  # entry
     cv2.line(annotated, tuple(xl), tuple(xr), (60, 60, 200), 2)  # exit
 
     # ── workspace center crosshair (X=0, Y=0) ────────────────────────────
